@@ -6,6 +6,7 @@ first validation set V, and with no true-match query used in stage-1 training),
 score every query that truly matches W or has a W entity among its top blocking
 candidates, and save the pruned stage-1 scores like val_scores_s1.parquet.
 """
+import os
 import sys
 import time
 
@@ -40,22 +41,34 @@ def main():
     wq = (pl.concat([gt.filter(pl.col("true_e").is_in(W.implode()))["q_rid"], near]).unique()
           .to_frame("q_rid").join(train_q, on="q_rid", how="anti").join(old_q, on="q_rid", how="anti"))
     print(f"W entities {W.len():,}  new queries {wq.height:,}  {time.time() - t:.0f}s", flush=True)
-    pairs = cand.join(wq.lazy(), on="q_rid").collect()
     views = F.SparseViews(rec.filter(pl.col("src") == 1))
     m1 = lgb.Booster(model_file=config.work("model_s1.txt"))
-    qids = wq["q_rid"]
-    out = []
-    step = 150_000
+    qids = wq["q_rid"].sort()
+    # chunked like predict.score: only one chunk of candidate pairs is in memory at a time
+    # (collecting all pairs up front grew past 17 GB), and each chunk is saved so an
+    # interrupted run resumes
+    part_dir = config.work(f"val2_parts_{FRAC}")
+    os.makedirs(part_dir, exist_ok=True)
+    step = 100_000
     for i in range(0, qids.len(), step):
-        X = F.build(pairs.join(qids.slice(i, step).to_frame(), on="q_rid"), rec, views)
+        part = os.path.join(part_dir, f"part_{i:09d}.parquet")
+        if os.path.exists(part):
+            continue
+        ids = qids.slice(i, step)
+        pairs = (cand.filter(pl.col("q_rid").is_between(ids.min(), ids.max())
+                             & pl.col("q_rid").is_in(ids.implode())).collect())
+        X = F.build(pairs, rec, views)
         p = m1.predict(X.select(F.FEATURES).to_numpy().astype(np.float32),
                        num_threads=config.N_JOBS)
-        out.append(X.select("q_rid", "e_rid", *stage2.CARRY)
-                   .with_columns(pl.Series("p", p.astype(np.float32)))
-                   .filter(pl.col("p") >= stage2.PRUNE))
+        (X.select("q_rid", "e_rid", *stage2.CARRY)
+         .with_columns(pl.Series("p", p.astype(np.float32)))
+         .filter(pl.col("p") >= stage2.PRUNE)).write_parquet(part + ".tmp")
+        os.replace(part + ".tmp", part)
+        del X, pairs
         print(f"[ext] {min(i + step, qids.len()):,}/{qids.len():,}  {time.time() - t:.0f}s",
               flush=True)
-    pl.concat(out).write_parquet(config.work("val2_scores_s1.parquet"))
+    pl.read_parquet(os.path.join(part_dir, "part_*.parquet")).write_parquet(
+        config.work("val2_scores_s1.parquet"))
     W.to_frame("rid").write_parquet(config.work("val2_entities.parquet"))
     print(f"done {time.time() - t:.0f}s")
 
