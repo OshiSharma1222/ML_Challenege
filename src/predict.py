@@ -85,14 +85,24 @@ def main():
     sc = pl.read_parquet(config.work("test_scores_s1.parquet"))
     if cfg["stage"] == 2:
         m2 = lgb.Booster(model_file=config.work(f"model_s2{TAG}.txt"))
-        idf = fine.init_idf(s1["core_sk"])
-        X2 = stage2.build(sc, rec, idf)
-        sc = X2.select("q_rid", "e_rid").with_columns(pl.Series(
-            "p", m2.predict(X2.select(stage2.FEATURES).to_numpy().astype(np.float32),
-                            num_threads=config.N_JOBS)))
+        # stage-2 features depend only on the cached stage-1 scores, so they are cached too:
+        # a retrained stage-2 model or a new decision rule then takes minutes, not a rebuild
+        fpath = config.work("test_s2_feats.parquet")
+        X2 = pl.read_parquet(fpath) if os.path.exists(fpath) else None
+        if X2 is None or not set(stage2.FEATURES) <= set(X2.columns):
+            X2 = stage2.build(sc, rec, fine.init_idf(s1["core_sk"]))
+            X2 = X2.select("q_rid", "e_rid", *stage2.FEATURES)
+            X2.write_parquet(fpath)
+        p = m2.predict(X2.select(stage2.FEATURES).to_numpy().astype(np.float32),
+                       num_threads=config.N_JOBS)
+        r = cfg.get("shift", 1.0)  # prior shift: odds multiplier for test's confuser density
+        p = r * p / (r * p + 1 - p)
+        sc = X2.select("q_rid", "e_rid").with_columns(pl.Series("p", p))
+        del X2
     pred = decide(sc) if cfg.get("rule") == "expf" else assign(sc, cfg["thr"])
     print(f"[predict] {pred.height:,} matched queries of {sc['q_rid'].n_unique():,} "
-          f"(rule {cfg.get('rule', 'thr')}, thr {cfg['thr']}, stage {cfg['stage']})  "
+          f"(rule {cfg.get('rule', 'thr')}, thr {cfg['thr']}, shift {cfg.get('shift', 1.0)}, "
+          f"stage {cfg['stage']})  "
           f"{time.time() - t:.0f}s")
     s1ids = s1.select("rid", "entity_id")
     write_lists(s1ids, pred.select("e_rid", "q_rid"), "matched_entity_ids",
