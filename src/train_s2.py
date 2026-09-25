@@ -57,6 +57,7 @@ def main():
         print(f"[s2] fold {k} done", flush=True)
     s1_best = json.load(open(config.work("thr_stage1.json")))
     s2 = X.select("q_rid", "e_rid").with_columns(pl.Series("p", oof))
+    s2.write_parquet(config.work(f"s2_oof{TAG}.parquet"))
     best2 = report(s2, gt, val_e, "stage2")
     m = lgb.train(PARAMS, lgb.Dataset(A[inV], label=y[inV], feature_name=stage2.FEATURES),
                   num_boost_round=ROUNDS)
