@@ -14,6 +14,7 @@ import polars as pl
 import config
 import fine
 import stage2
+from decide import decide
 from pipeline import load_records, gt_pairs, assign, f05_macro
 from train import report
 
@@ -32,6 +33,7 @@ def main():
     idf = fine.init_idf(rec.filter(pl.col("src") == 1)["core_sk"])
     val_e = pl.read_parquet(config.work("val_entities.parquet"))["rid"]
     sc = pl.read_parquet(config.work("val_scores_s1.parquet"))
+    v0 = val_e  # the original held-out entities, kept for like-for-like comparisons
     if "--ext" in sys.argv:  # extra out-of-sample entities from extend_val.py
         val_e = pl.concat([val_e, pl.read_parquet(config.work("val2_entities.parquet"))["rid"]])
         sc = pl.concat([sc, pl.read_parquet(config.work("val2_scores_s1.parquet"))
@@ -59,12 +61,19 @@ def main():
     s2 = X.select("q_rid", "e_rid").with_columns(pl.Series("p", oof))
     s2.write_parquet(config.work(f"s2_oof{TAG}.parquet"))
     best2 = report(s2, gt, val_e, "stage2")
+    gt_all, gt_v0 = (gt.filter(pl.col("true_e").is_in(v.implode())) for v in (val_e, v0))
+    f_rule = f05_macro(decide(s2), gt_all, val_e)[0]
+    print(f"[s2] expected-F rule F0.5={f_rule:.5f} vs threshold {best2[1]:.5f}")
+    print(f"[s2] original val entities: threshold {f05_macro(assign(s2, best2[0]), gt_v0, v0)[0]:.5f}"
+          f"  expected-F rule {f05_macro(decide(s2), gt_v0, v0)[0]:.5f}", flush=True)
     m = lgb.train(PARAMS, lgb.Dataset(A[inV], label=y[inV], feature_name=stage2.FEATURES),
                   num_boost_round=ROUNDS)
     m.save_model(config.work(f"model_s2{TAG}.txt"))
     stage = 2 if best2[1] > s1_best["f05"] else 1
     thr = best2[0] if stage == 2 else s1_best["thr"]
-    json.dump({"stage": stage, "thr": thr, "f05_stage1": s1_best["f05"], "f05_stage2": best2[1]},
+    rule = "expf" if stage == 2 and f_rule > best2[1] else "thr"
+    json.dump({"stage": stage, "thr": thr, "rule": rule, "f05_stage1": s1_best["f05"],
+               "f05_stage2": best2[1], "f05_stage2_expf": f_rule},
               open(config.work(f"final{TAG}.json"), "w"), indent=1)
     print(f"[s2] stage1 F0.5={s1_best['f05']:.5f}  stage2 F0.5={best2[1]:.5f} -> use stage {stage}")
 

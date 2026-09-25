@@ -18,6 +18,7 @@ import config
 import features as F
 from pipeline import load_records, assign
 import fine
+from decide import decide
 import stage2
 
 TAG = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--tag=')), '')
@@ -89,9 +90,10 @@ def main():
         sc = X2.select("q_rid", "e_rid").with_columns(pl.Series(
             "p", m2.predict(X2.select(stage2.FEATURES).to_numpy().astype(np.float32),
                             num_threads=config.N_JOBS)))
-    pred = assign(sc, cfg["thr"])
+    pred = decide(sc) if cfg.get("rule") == "expf" else assign(sc, cfg["thr"])
     print(f"[predict] {pred.height:,} matched queries of {sc['q_rid'].n_unique():,} "
-          f"(thr {cfg['thr']}, stage {cfg['stage']})  {time.time() - t:.0f}s")
+          f"(rule {cfg.get('rule', 'thr')}, thr {cfg['thr']}, stage {cfg['stage']})  "
+          f"{time.time() - t:.0f}s")
     s1ids = s1.select("rid", "entity_id")
     write_lists(s1ids, pred.select("e_rid", "q_rid"), "matched_entity_ids",
                 os.path.join(config.OUT_DIR, "matching_results.tsv"))
