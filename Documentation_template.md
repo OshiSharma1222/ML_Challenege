@@ -15,7 +15,7 @@ A CPU-only, three-stage pipeline.
 
 The key structural insight is that every Source 2/3 record belongs to at most one Source 1 entity. Matching is therefore an assignment problem: each record goes to its best entity, or to none.
 
-Validation macro F0.5 (held-out Source 1 entities, singletons included): **0.9753**.
+Validation macro F0.5 (held-out Source 1 entities, singletons included): **0.9770**.
 
 ---
 
@@ -121,11 +121,11 @@ EDA on the 2.2M Source 1 and 10.3M Source 2/3 training records:
 
 **Model type:** LightGBM binary classifiers (MIT license, trained from scratch; no pretrained or external model).
 - Stage 1: 255 leaves, lr 0.05, early stopping, trained on all ~13M candidate pairs of 500k training records.
-- Stage 2: 63 leaves, 600 rounds, 5-fold CV grouped by true entity.
+- Stage 2: 63 leaves, 600 rounds, 5-fold CV grouped by true entity, trained on 10% of Source 1 entities held out from stage 1 (2% validation + 8% extra from `extend_val.py`).
 
-**Decision rule:** each Source 2/3 record is assigned to its highest-probability S1 candidate if p ≥ threshold, otherwise to no entity. An S1 entity's match list is the set of records assigned to it; an empty list marks it as a singleton.
+**Decision rule:** each Source 2/3 record first picks its highest-probability S1 candidate. Each S1 entity then keeps the top k of the records that picked it, choosing the k (0 allowed) that maximises expected F0.5 under the stage-2 probabilities (Monte-Carlo estimate, `src/decide.py`). An empty list marks a singleton. Because macro F0.5 averages per entity, one false merge costs a match-less entity its whole score, so a per-entity rule beats a single global threshold.
 
-**Threshold selection method:** a sweep of macro F0.5 on held-out entities; best threshold 0.75. The stage-2 CV curve is flat between 0.60 and 0.80 (±0.0002).
+**Threshold selection method:** the expected-F rule needs no threshold. For reference, the best global threshold (macro-F0.5 sweep on held-out entities) is 0.70, and the curve is flat between 0.60 and 0.80 (±0.0002).
 
 ---
 
@@ -140,7 +140,9 @@ EDA on the 2.2M Source 1 and 10.3M Source 2/3 training records:
 |---|---|
 | Stage 1 (pair features) | 0.9673 |
 | + Stage 2 context features | 0.9697 |
-| + Stage 2 fine-grained features | **0.9753** |
+| + Stage 2 fine-grained features | 0.9753 |
+| + 5× stage-2 training entities | 0.9764 |
+| + expected-F0.5 decision rule | **0.9770** |
 
 Stage-1 breakdown (threshold 0.65):
 - non-singleton entities: mean precision 0.985, mean recall 0.932;
