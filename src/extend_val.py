@@ -20,6 +20,9 @@ import stage2
 from pipeline import load_records, gt_pairs
 
 FRAC = float(sys.argv[1]) if len(sys.argv) > 1 else 0.08
+# --out=val3 draws a further entity set disjoint from every earlier one (val, val2, ...)
+OUT = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--out=")), "val2")
+PREV = ["val"] + [f"val{i}" for i in range(2, int(OUT[3:] or 2))]
 
 
 def main():
@@ -27,17 +30,19 @@ def main():
     rec = load_records("train")
     gt = gt_pairs(rec)
     train_q = pl.scan_parquet(config.work("feat_tr_*.parquet")).select("q_rid").unique().collect()
-    val_e = pl.read_parquet(config.work("val_entities.parquet"))
+    val_e = pl.concat([pl.read_parquet(config.work(f"{v}_entities.parquet")) for v in PREV])
     tainted = gt.join(train_q, on="q_rid")["true_e"].unique()
     s1 = rec.filter(pl.col("src") == 1).select("rid")
     pool = s1.filter(~pl.col("rid").is_in(val_e["rid"].implode())
                      & ~pl.col("rid").is_in(tainted.implode()))
-    W = pool.sample(fraction=FRAC / (pool.height / s1.height), seed=5)["rid"]
+    seed = 5 if OUT == "val2" else 5 + int(OUT[3:])
+    W = pool.sample(fraction=FRAC / (pool.height / s1.height), seed=seed)["rid"]
     cand = pl.scan_parquet(config.work("train_cand.parquet"))
     near = (cand.filter(pl.col("e_rid").is_in(W.implode())
                         & ((pl.col("br_f") <= 2) | (pl.col("br_n") <= 1)))
             .select("q_rid").collect()["q_rid"])
-    old_q = pl.scan_parquet(config.work("val_scores_s1.parquet")).select("q_rid").unique().collect()
+    old_q = pl.concat([pl.scan_parquet(config.work(f"{v}_scores_s1.parquet")).select("q_rid")
+                       .unique().collect() for v in PREV]).unique()
     wq = (pl.concat([gt.filter(pl.col("true_e").is_in(W.implode()))["q_rid"], near]).unique()
           .to_frame("q_rid").join(train_q, on="q_rid", how="anti").join(old_q, on="q_rid", how="anti"))
     print(f"W entities {W.len():,}  new queries {wq.height:,}  {time.time() - t:.0f}s", flush=True)
@@ -47,7 +52,7 @@ def main():
     # chunked like predict.score: only one chunk of candidate pairs is in memory at a time
     # (collecting all pairs up front grew past 17 GB), and each chunk is saved so an
     # interrupted run resumes
-    part_dir = config.work(f"val2_parts_{FRAC}")
+    part_dir = config.work(f"{OUT}_parts_{FRAC}")
     os.makedirs(part_dir, exist_ok=True)
     step = 100_000
     for i in range(0, qids.len(), step):
@@ -68,8 +73,8 @@ def main():
         print(f"[ext] {min(i + step, qids.len()):,}/{qids.len():,}  {time.time() - t:.0f}s",
               flush=True)
     pl.read_parquet(os.path.join(part_dir, "part_*.parquet")).write_parquet(
-        config.work("val2_scores_s1.parquet"))
-    W.to_frame("rid").write_parquet(config.work("val2_entities.parquet"))
+        config.work(f"{OUT}_scores_s1.parquet"))
+    W.to_frame("rid").write_parquet(config.work(f"{OUT}_entities.parquet"))
     print(f"done {time.time() - t:.0f}s")
 
 

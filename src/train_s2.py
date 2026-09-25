@@ -90,10 +90,12 @@ def main():
     val_e = pl.read_parquet(config.work("val_entities.parquet"))["rid"]
     sc = pl.read_parquet(config.work("val_scores_s1.parquet"))
     v0 = val_e  # the original held-out entities, kept for like-for-like comparisons
-    if "--ext" in sys.argv:  # extra out-of-sample entities from extend_val.py
-        val_e = pl.concat([val_e, pl.read_parquet(config.work("val2_entities.parquet"))["rid"]])
-        sc = pl.concat([sc, pl.read_parquet(config.work("val2_scores_s1.parquet"))
-                        .select(sc.columns)])
+    if any(a.startswith("--ext") for a in sys.argv):  # extra out-of-sample entities from extend_val.py
+        n_ext = int(next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--ext=")), 2))
+        for v in [f"val{i}" for i in range(2, n_ext + 1)]:
+            val_e = pl.concat([val_e, pl.read_parquet(config.work(f"{v}_entities.parquet"))["rid"]])
+            sc = pl.concat([sc, pl.read_parquet(config.work(f"{v}_scores_s1.parquet"))
+                            .select(sc.columns)])
     sc = sc.filter(pl.col("p") >= stage2.PRUNE)
     gt_all, gt_v0 = (gt.filter(pl.col("true_e").is_in(v.implode())) for v in (val_e, v0))
     s1_best = json.load(open(config.work("thr_stage1.json")))
