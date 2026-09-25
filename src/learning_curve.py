@@ -30,10 +30,9 @@ def main():
     gt = gt_pairs(rec)
     del rec
     val_e = pl.read_parquet(config.work("val_entities.parquet"))["rid"]
-    tr = read_feats("tr")
-    qs = tr.select("q_rid").unique().sample(fraction=FRAC, seed=21)
-    Xtr = label(tr.join(qs, on="q_rid"), gt)
-    del tr
+    tr = pl.scan_parquet(config.work("feat_tr_*.parquet"))
+    qs = tr.select("q_rid").unique().collect().sample(fraction=FRAC, seed=21)
+    Xtr = label(tr.join(qs.lazy(), on="q_rid").collect(), gt)  # only the sampled pairs are loaded
     gc.collect()
     va_q = pl.scan_parquet(config.work("feat_va_*.parquet")).select("q_rid").unique().collect()
     es_q = va_q["q_rid"].sample(min(120_000, va_q.height), seed=3).implode()

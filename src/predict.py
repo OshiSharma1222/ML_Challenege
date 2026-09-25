@@ -93,7 +93,7 @@ def main():
             X2 = stage2.build(sc, rec, fine.init_idf(s1["core_sk"]))
             X2 = X2.select("q_rid", "e_rid", *stage2.FEATURES)
             X2.write_parquet(fpath)
-        p = m2.predict(X2.select(stage2.FEATURES).to_numpy().astype(np.float32),
+        p = m2.predict(X2.select(m2.feature_name()).to_numpy().astype(np.float32),
                        num_threads=config.N_JOBS)
         r = cfg.get("shift", 1.0)  # prior shift: odds multiplier for test's confuser density
         p = r * p / (r * p + 1 - p)

@@ -32,6 +32,10 @@ PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_data_in
               num_threads=config.N_JOBS, verbose=-1)
 ROUNDS = 600
 SHIFTS = (1.0, 0.7, 0.5, 0.35, 0.25)
+# --noent drops the entity-side context features, the only ones that change when an
+# entity is crowded by more confusers (test has ~2x as many per entity as train)
+ENT = ["e_nwin_other", "e_psum", "e_rank", "e_pmax"]
+FEATS = [f for f in stage2.FEATURES if f not in ENT] if "--noent" in sys.argv else stage2.FEATURES
 
 
 def with_copies(sc, gt, n):
@@ -56,7 +60,7 @@ def build(sc, rec, idf, gt, val_e):
           .join(gt.rename({"q_rid": "orig"}), on="orig", how="left"))
     fold = tq.with_columns((pl.coalesce("true_e", "orig").hash(7) % 5).alias("fold"))
     X = X.join(fold.select("q_rid", "fold"), on="q_rid")
-    return (X.select("q_rid", "e_rid"), X.select(stage2.FEATURES).to_numpy().astype(np.float32),
+    return (X.select("q_rid", "e_rid"), X.select(FEATS).to_numpy().astype(np.float32),
             X["y"].to_numpy(), X["fold"].to_numpy(), X["e_rid"].is_in(val_e.implode()).to_numpy())
 
 
@@ -67,7 +71,7 @@ def cv(train, pred):
     oof = np.zeros(len(fp), dtype=np.float32)
     for k in range(5):
         tr = (fo != k) & inV
-        m = lgb.train(PARAMS, lgb.Dataset(A[tr], label=y[tr], feature_name=stage2.FEATURES),
+        m = lgb.train(PARAMS, lgb.Dataset(A[tr], label=y[tr], feature_name=FEATS),
                       num_boost_round=ROUNDS)
         oof[fp == k] = m.predict(Ap[fp == k])
         print(f"[s2] fold {k} done", flush=True)
@@ -104,7 +108,18 @@ def main():
         print(f"[s2] original val entities: threshold "
               f"{f05_macro(assign(s2, best2[0]), gt_v0, v0)[0]:.5f}  expected-F rule "
               f"{f05_macro(decide(s2), gt_v0, v0)[0]:.5f}", flush=True)
-        final, shift = base, 1.0
+        # test-like check by copying confuser queries' prediction rows: exact for a model
+        # without entity-side features (the query-side features of a copy are unchanged)
+        top = int(s2["q_rid"].max()) + 1
+        sim = pl.concat([s2, s2.join(gt.select("q_rid"), on="q_rid", how="anti")
+                         .with_columns(pl.col("q_rid") + top)])
+        sims = {r: f05_macro(decide(shifted(sim, r)), gt_all, val_e)[0] for r in SHIFTS}
+        for r, f in sims.items():
+            print(f"[s2] test-like val (row copies) shift {r}: expected-F rule F0.5={f:.5f}"
+                  f"{'' if '--noent' in sys.argv else '  (optimistic: entity features not rebuilt)'}",
+                  flush=True)
+        final = base
+        shift = max(sims, key=sims.get) if "--noent" in sys.argv else 1.0
         stage = 2 if best2[1] > s1_best["f05"] else 1
         thr = best2[0] if stage == 2 else s1_best["thr"]
         rule = "expf" if stage == 2 and f_rule > best2[1] else "thr"
@@ -128,7 +143,7 @@ def main():
         extra = {"f05_testlike": f_best, "model": name,
                  "all": {f"{k[0]}@{k[1]}": v for k, v in results.items()}}
     _, A, y, _, inV = final
-    m = lgb.train(PARAMS, lgb.Dataset(A[inV], label=y[inV], feature_name=stage2.FEATURES),
+    m = lgb.train(PARAMS, lgb.Dataset(A[inV], label=y[inV], feature_name=FEATS),
                   num_boost_round=ROUNDS)
     m.save_model(config.work(f"model_s2{TAG}.txt"))
     json.dump({"stage": stage, "thr": thr, "rule": rule, "shift": shift,
