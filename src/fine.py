@@ -120,10 +120,14 @@ def build(pairs: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
                right_on="rid_q", how="left")
          .join(rec.select(cols).rename({c: c + "_e" for c in cols}), left_on="e_rid",
                right_on="rid_e", how="left"))
-    rows = list(zip(P["core_q"].to_list(), P["core_e"].to_list(), P["name_full_q"].to_list(),
-                    P["name_full_e"].to_list(), P["nums_q"].to_list(), P["nums_e"].to_list()))
     _set_idf(*idf)
-    res = [_one(r) for r in rows]
-    arr = np.asarray(res, dtype=np.float32).reshape(-1, len(FINE))
+    # batched so only 500k pairs are ever held as Python objects (10M+ at once exhausts RAM)
+    arr = np.empty((P.height, len(FINE)), dtype=np.float32)
+    for s in range(0, P.height, 500_000):
+        C = P.slice(s, 500_000)
+        rows = zip(C["core_q"].to_list(), C["core_e"].to_list(), C["name_full_q"].to_list(),
+                   C["name_full_e"].to_list(), C["nums_q"].to_list(), C["nums_e"].to_list())
+        arr[s:s + C.height] = np.asarray([_one(r) for r in rows],
+                                         dtype=np.float32).reshape(-1, len(FINE))
     return P.select("q_rid", "e_rid").with_columns(
         [pl.Series(n, arr[:, i]) for i, n in enumerate(FINE)])

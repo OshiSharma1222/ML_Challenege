@@ -16,13 +16,15 @@ CARRY = ["n_tset", "n_ratio", "sk_ratio", "cos_name", "cos_addr", "cos_num", "a_
 
 def build(sc: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
     q, e = "q_rid", "e_rid"
-    m1 = pl.col("p").max().over(q)
+    # q_max is materialised first: a window nested inside another window is quadratic in
+    # polars (hours on the 10M test pairs), a window over a plain column is linear.
+    X = sc.with_columns(pl.col("p").max().over(q).alias("q_max"))
+    m1 = pl.col("q_max")
     n1 = (pl.col("p") == m1).sum().over(q)
-    m2 = pl.col("p").filter(pl.col("p") < m1).max().over(q).fill_null(0)
+    m2 = pl.when(pl.col("p") < m1).then(pl.col("p")).max().over(q).fill_null(0)
     other = pl.when((pl.col("p") == m1) & (n1 == 1)).then(m2).otherwise(m1)
-    X = sc.with_columns(
+    X = X.with_columns(
         (pl.col("p") - other).alias("q_gap"),
-        m1.alias("q_max"),
         pl.col("p").sum().over(q).alias("q_sum"),
         (pl.col("p") > 0.1).sum().over(q).cast(pl.Float32).alias("q_n10"),
         pl.col("p").rank("min", descending=True).over(q).cast(pl.Float32).alias("q_rank"),
