@@ -5,6 +5,7 @@ Every record becomes a sparse IDF-weighted bag of blocking tokens:
   j|<despaced name skeleton>          (catches "colonialfoods.com" vs "Colonial Foods")
   a|<address word skeleton / number>  (non-generic address words)
   b|<adjacent address pair>           (e.g. "17560_ls" = house number + street)
+  r|<exact name word>, s|<exact word pair>   (skeletons merge distinct names; see RAW_NAME)
 all prefixed by the record's country so different countries never collide.
 IDF comes from Source 1. For each Source 2/3 record (query) we take the top-K
 Source 1 records by cosine similarity (sparse_dot_topn, multithreaded).
@@ -28,7 +29,7 @@ K_FULL = 20    # candidates per query from the name+address index
 K_NAME = 10    # candidates per query from the name-only index
 # exact-spelling name words next to the skeletons: the skeleton merges distinct names
 # ("sweven", "seven", "shivam" -> "svn"), which crowds the true entity out of the top K
-RAW_NAME = os.environ.get("ER_BLOCK_RAW", "0") == "1"
+RAW_NAME = os.environ.get("ER_BLOCK_RAW", "1") == "1"
 
 
 def _skel_map(words: pl.Series) -> pl.DataFrame:

@@ -30,12 +30,14 @@ The script runs these stages in order. Run them one at a time, because two heavy
 
 | Step | Script | What it does | Time |
 | --- | --- | --- | --- |
-| 1 | `src/prep.py train test` | Transliterate (anyascii) and normalise names and addresses; build legal-form, state and house-number fields | ~5 min |
-| 2 | `src/blocking.py train` / `test` | TF-IDF sparse top-K candidate generation: a name+address index (K=20) unioned with a name-only index (K=10) | ~17 min each |
-| 3 | `src/train.py 500000` | Stage-1 LightGBM pair model (68 features), validation split, threshold sweep | ~25 min |
-| 4 | `src/extend_val.py 0.08` | Stage-1 scores for 8% more held-out entities (more stage-2 training data) | ~20 min |
-| 5 | `src/train_s2.py --ext --tag=_ext` | Stage-2 LightGBM re-scorer (context + fine-grained features), 5-fold CV, decision rule | ~10 min |
-| 6 | `src/predict.py --tag=_ext` | Test inference; writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` | ~2.5 h |
+| 1 | `src/prep.py train test` | Transliterate (anyascii) and normalise names and addresses; build legal-form, state and house-number fields (US states, Indian states, French regions/departments) | ~5 min |
+| 2 | `src/blocking.py train` / `test` | TF-IDF sparse top-K candidate generation over phonetic *and* exact-spelling name tokens plus address tokens: a name+address index (K=20) unioned with a name-only index (K=10) | ~15-18 min each |
+| 3 | `src/train.py 500000` | Stage-1 LightGBM pair model (66 features), validation split, threshold sweep | ~22 min |
+| 4 | `src/extend_val.py 0.08`, then `0.10 --out=val3` | Stage-1 scores for two further disjoint held-out entity sets (more stage-2 training data) | ~20 min each |
+| 5 | `src/train_s2.py --ext=3 --noent --tag=_noent3` | Stage-2 LightGBM re-scorer (43 features, no entity-side features), 5-fold CV, test-like check, decision rule | ~23 min |
+| 6 | `src/predict.py --tag=_noent3` | Test inference; writes `output/matching_results.tsv` and `output/candidate_pairs.tsv` | ~3 h |
+
+Times are with 10 threads (`ER_JOBS=10`, `POLARS_MAX_THREADS=10`).
 
 Validate the outputs:
 
@@ -62,6 +64,7 @@ python utils/validate_submission.py --matching output/matching_results.tsv \
 | `src/decide.py` | Entity-level decision rule maximising expected F0.5 |
 | `src/analyze.py` | Validation error buckets and the F0.5 each one costs |
 | `src/predict.py` | Test inference and output writing |
+| `src/fix_fr.py` | Patch utility only: re-normalises France test records and re-scores the affected queries in an existing `work/` (a clean `run_all.sh` does not need it) |
 
 ## Decision rule
 

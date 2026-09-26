@@ -124,7 +124,8 @@ def main():
         shift = max(sims, key=sims.get) if "--noent" in sys.argv else 1.0
         stage = 2 if best2[1] > s1_best["f05"] else 1
         thr = best2[0] if stage == 2 else s1_best["thr"]
-        rule = "expf" if stage == 2 and f_rule > best2[1] else "thr"
+        # with --noent the shift is chosen on the test-like check, which uses the expected-F rule
+        rule = "expf" if stage == 2 and ("--noent" in sys.argv or f_rule > best2[1]) else "thr"
         extra = {"f05_stage2": best2[1], "f05_stage2_expf": f_rule}
     else:
         dup = build(with_copies(sc, gt, DUP), rec, idf, gt, val_e)
