@@ -14,6 +14,16 @@ neighbour votes with its own stage-1 scores:
   nb_s1     similarity of the closest neighbour (query level)
   nb_vgap   nb_vw minus the best nb_vw of the query's other candidates
 
+Cluster consensus (close neighbours, similarity >= CLOSE): a look-alike business is a perturbed
+copy with its *own* records, which agree with each other, while noise in a true match's record
+is random per record. So for a pair whose house numbers or name words differ, it matters which
+side the cluster agrees with:
+  nb_nclose  number of close neighbours
+  nb_hn_e    close neighbours whose first house number equals the entity's
+  nb_hn_q    close neighbours whose first house number equals the query's
+  nb_xq      mean share of the query's extra name words (not in the entity) found in a neighbour
+  nb_xe      mean share of the entity's extra name words (not in the query) found in a neighbour
+
 Entities voted for strongly (similarity * p >= NEW_MIN) but absent from the query's scored
 candidates become new candidate pairs, scored by the stage-1 model like any other pair.
 """
@@ -35,7 +45,9 @@ N_CHUNKS = 4     # index chunks over the S2/S3 pool (bounds memory)
 Q_CHUNK = 500_000
 NEW_MIN = 0.35   # similarity * neighbour p needed to propose a new candidate
 NEW_PER_Q = 2
-NB_FEATURES = ["nb_v1", "nb_vmax", "nb_vw", "nb_vsum", "nb_nv", "nb_s1", "nb_vgap"]
+CLOSE = 0.5      # neighbour similarity counted as "same cluster" for the consensus features
+NB_FEATURES = ["nb_v1", "nb_vmax", "nb_vw", "nb_vsum", "nb_nv", "nb_s1", "nb_vgap",
+               "nb_nclose", "nb_hn_e", "nb_hn_q", "nb_xq", "nb_xe"]
 ENABLED = os.environ.get("ER_NB", "0") == "1"
 _COLS = ["rid", "src", "country", "core", "core_sk", "alt", "addr"]
 
@@ -105,15 +117,45 @@ def _score_pairs(pairs, split):
     return pl.concat(outs)
 
 
-def _features(nb, all_sc, sc_pairs):
+def keys(split):
+    """rid -> first house number and name-core word list, for the consensus features."""
+    return (pl.read_parquet(config.work(f"{split}_records.parquet"), columns=["rid", "nums", "core"])
+            .select("rid", pl.col("nums").fill_null("").str.split(" ").list.first().fill_null("").alias("hn"),
+                    pl.col("core").fill_null("").str.split(" ").list.eval(pl.element().filter(pl.element() != ""))
+                    .alias("tk")))
+
+
+def consensus(pairs, nb, rk):
+    """Cluster-consensus features for (q_rid, e_rid) pairs."""
+    close = nb.filter(pl.col("s") >= CLOSE).select("q_rid", "r_rid")
+    P = (pairs.join(rk.rename({"rid": "q_rid", "hn": "hq", "tk": "tq"}), on="q_rid", how="left")
+         .join(rk.rename({"rid": "e_rid", "hn": "he", "tk": "te"}), on="e_rid", how="left")
+         .with_columns(pl.col("tq").list.set_difference("te").alias("xq"),
+                       pl.col("te").list.set_difference("tq").alias("xe")))
+    Y = (P.select("q_rid", "e_rid", "hq", "he", "xq", "xe").join(close, on="q_rid")
+         .join(rk.rename({"rid": "r_rid", "hn": "hr", "tk": "tr"}), on="r_rid", how="left"))
+    Y = Y.with_columns(
+        ((pl.col("hr") == pl.col("he")) & (pl.col("he") != "")).cast(pl.Float32).alias("a_e"),
+        ((pl.col("hr") == pl.col("hq")) & (pl.col("hq") != "")).cast(pl.Float32).alias("a_q"),
+        (pl.col("xq").list.set_intersection("tr").list.len() / pl.col("xq").list.len().clip(1)).alias("x_q"),
+        (pl.col("xe").list.set_intersection("tr").list.len() / pl.col("xe").list.len().clip(1)).alias("x_e"))
+    return Y.group_by("q_rid", "e_rid").agg(
+        pl.len().cast(pl.Float32).alias("nb_nclose"), pl.col("a_e").sum().alias("nb_hn_e"),
+        pl.col("a_q").sum().alias("nb_hn_q"), pl.col("x_q").mean().alias("nb_xq"),
+        pl.col("x_e").mean().alias("nb_xe"))
+
+
+def _features(nb, all_sc, sc_pairs, rk):
     """Votes for one chunk of queries: (new candidate pairs, nb features for sc_pairs + new)."""
     vt = votes(nb, all_sc)
     new = (vt.filter(pl.col("nb_vw") >= NEW_MIN).join(sc_pairs, on=["q_rid", "e_rid"], how="anti")
            .sort("nb_vw", descending=True).group_by("q_rid", maintain_order=True).head(NEW_PER_Q)
            .select("q_rid", "e_rid"))
     s1 = nb.filter(pl.col("r_rank") == 1).select("q_rid", pl.col("s").alias("nb_s1"))
-    f = (pl.concat([sc_pairs, new]).join(vt, on=["q_rid", "e_rid"], how="left").fill_null(0)
-         .join(s1, on="q_rid", how="left").with_columns(pl.col("nb_s1").fill_null(0)))
+    pairs = pl.concat([sc_pairs, new])
+    f = (pairs.join(vt, on=["q_rid", "e_rid"], how="left").fill_null(0)
+         .join(s1, on="q_rid", how="left").with_columns(pl.col("nb_s1").fill_null(0))
+         .join(consensus(pairs, nb, rk), on=["q_rid", "e_rid"], how="left").fill_null(0))
     top = pl.col("nb_vw").max().over("q_rid")
     n_top = (pl.col("nb_vw") == top).sum().over("q_rid")
     second = pl.when(pl.col("nb_vw") < top).then(pl.col("nb_vw")).max().over("q_rid").fill_null(0)
@@ -134,14 +176,15 @@ def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
     all_sc = (sc if all_sc is None else all_sc).select(pl.col("q_rid").alias("r_rid"), "e_rid", "p")
     qids = sc["q_rid"].unique().sort()
     nb = search(split, qids.to_numpy(), log).join(pl.DataFrame({"q_rid": qids}), on="q_rid", how="semi")
+    rk = keys(split)
     news, feats = [], []
     for i in range(0, len(qids), q_chunk):
         lo, hi = qids[i], qids[min(i + q_chunk, len(qids)) - 1]
         inq = pl.col("q_rid").is_between(lo, hi)
-        new, f = _features(nb.filter(inq), all_sc, sc.filter(inq).select("q_rid", "e_rid"))
+        new, f = _features(nb.filter(inq), all_sc, sc.filter(inq).select("q_rid", "e_rid"), rk)
         news.append(new)
         feats.append(f)
-    del nb, all_sc
+    del nb, all_sc, rk
     new, f = pl.concat(news), pl.concat(feats)
     print(f"[{log}] {new.height:,} new candidate pairs  {time.time() - t:.0f}s", flush=True)
     if new.height:
