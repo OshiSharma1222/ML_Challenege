@@ -28,7 +28,7 @@ import blocking as B
 import config
 import features as F
 import stage2
-from pipeline import load_records
+from pipeline import LOAD_COLS
 
 K = 5            # neighbours per record
 N_CHUNKS = 4     # index chunks over the S2/S3 pool (bounds memory)
@@ -72,9 +72,8 @@ def search(split, qrids, log="nb"):
 
 
 def votes(nb, sc):
-    """Vote table (q_rid, e_rid, nb_*) from neighbour links and all stage-1 scores `sc`."""
-    v = (nb.join(sc.select(pl.col("q_rid").alias("r_rid"), "e_rid", pl.col("p").alias("pr")),
-                 on="r_rid")
+    """Vote table (q_rid, e_rid, nb_*) from neighbour links and stage-1 scores sc (r_rid, e_rid, p)."""
+    v = (nb.join(sc.rename({"p": "pr"}), on="r_rid")
          .with_columns((pl.col("s") * pl.col("pr")).alias("w")))
     agg = v.group_by("q_rid", "e_rid").agg(
         pl.when(pl.col("r_rank") == 1).then(pl.col("pr")).max().fill_null(0).alias("nb_v1"),
@@ -88,49 +87,75 @@ def votes(nb, sc):
 
 def _score_pairs(pairs, split):
     """Stage-1 score new (q_rid, e_rid) pairs; same output columns as the score caches."""
-    rec = load_records(split)
+    qs = pairs.select(pl.col("q_rid").alias("rid")).unique()
+    rec = (pl.scan_parquet(config.work(f"{split}_records.parquet")).select(LOAD_COLS)
+           .filter((pl.col("src") == 1) | pl.col("rid").is_in(qs["rid"].implode())).collect())
     views = F.SparseViews(rec.filter(pl.col("src") == 1))
     m1 = lgb.Booster(model_file=config.work("model_s1.txt"))
     pairs = pairs.with_columns(pl.lit(0.0, pl.Float32).alias("bs_f"), pl.lit(99, pl.UInt8).alias("br_f"),
                                pl.lit(0.0, pl.Float32).alias("bs_n"), pl.lit(99, pl.UInt8).alias("br_n"))
     outs = []
-    for i in range(0, pairs.height, 2_000_000):
-        X = F.build(pairs.slice(i, 2_000_000), rec, views)
+    pairs = pairs.sort("q_rid")  # contiguous queries per chunk keep the per-chunk query set small
+    for i in range(0, pairs.height, 300_000):
+        X = F.build(pairs.slice(i, 300_000), rec, views)
         p = m1.predict(X.select(F.FEATURES).to_numpy().astype(np.float32), num_threads=config.N_JOBS)
         outs.append(X.select("q_rid", "e_rid", *stage2.CARRY).with_columns(pl.Series("p", p.astype(np.float32))))
         del X
+        print(f"[nb-score] {min(i + 300_000, pairs.height):,}/{pairs.height:,} new pairs", flush=True)
     return pl.concat(outs)
 
 
-def augment(sc, split, all_sc=None, log="nb"):
-    """Add neighbour-proposed candidates to `sc` and return (sc_plus, nb feature table).
-
-    sc: the stage-1 pairs that go to stage 2. all_sc: every stage-1 score available for the
-    split (the neighbours' votes); defaults to sc.
-    """
-    t = time.time()
-    all_sc = sc if all_sc is None else all_sc
-    nb = search(split, sc["q_rid"].unique().to_numpy(), log)
-    nb = nb.join(sc.select("q_rid").unique(), on="q_rid", how="semi")
+def _features(nb, all_sc, sc_pairs):
+    """Votes for one chunk of queries: (new candidate pairs, nb features for sc_pairs + new)."""
     vt = votes(nb, all_sc)
-    new = (vt.filter(pl.col("nb_vw") >= NEW_MIN).join(sc.select("q_rid", "e_rid"), on=["q_rid", "e_rid"], how="anti")
+    new = (vt.filter(pl.col("nb_vw") >= NEW_MIN).join(sc_pairs, on=["q_rid", "e_rid"], how="anti")
            .sort("nb_vw", descending=True).group_by("q_rid", maintain_order=True).head(NEW_PER_Q)
            .select("q_rid", "e_rid"))
-    print(f"[{log}] {vt.height:,} vote rows, {new.height:,} new candidate pairs  {time.time() - t:.0f}s", flush=True)
-    if new.height:
-        scored = _score_pairs(new, split).select(sc.columns)
-        sc = pl.concat([sc, scored])
     s1 = nb.filter(pl.col("r_rank") == 1).select("q_rid", pl.col("s").alias("nb_s1"))
-    f = (sc.select("q_rid", "e_rid").join(vt, on=["q_rid", "e_rid"], how="left").fill_null(0)
+    f = (pl.concat([sc_pairs, new]).join(vt, on=["q_rid", "e_rid"], how="left").fill_null(0)
          .join(s1, on="q_rid", how="left").with_columns(pl.col("nb_s1").fill_null(0)))
     top = pl.col("nb_vw").max().over("q_rid")
     n_top = (pl.col("nb_vw") == top).sum().over("q_rid")
     second = pl.when(pl.col("nb_vw") < top).then(pl.col("nb_vw")).max().over("q_rid").fill_null(0)
     other = pl.when((pl.col("nb_vw") == top) & (n_top == 1)).then(second).otherwise(top)
     f = f.with_columns((pl.col("nb_vw") - other).alias("nb_vgap"))
+    f = f.select("q_rid", "e_rid", *NB_FEATURES).with_columns([pl.col(c).cast(pl.Float32) for c in NB_FEATURES])
+    return new, f
+
+
+def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
+    """Add neighbour-proposed candidates to `sc` and return (sc_plus, nb feature table).
+
+    sc: the stage-1 pairs that go to stage 2. all_sc: every stage-1 score available for the
+    split (the neighbours' votes); defaults to sc. Votes are computed per chunk of queries to
+    bound memory.
+    """
+    t = time.time()
+    all_sc = (sc if all_sc is None else all_sc).select(pl.col("q_rid").alias("r_rid"), "e_rid", "p")
+    qids = sc["q_rid"].unique().sort()
+    nb = search(split, qids.to_numpy(), log).join(pl.DataFrame({"q_rid": qids}), on="q_rid", how="semi")
+    news, feats = [], []
+    for i in range(0, len(qids), q_chunk):
+        lo, hi = qids[i], qids[min(i + q_chunk, len(qids)) - 1]
+        inq = pl.col("q_rid").is_between(lo, hi)
+        new, f = _features(nb.filter(inq), all_sc, sc.filter(inq).select("q_rid", "e_rid"))
+        news.append(new)
+        feats.append(f)
+    del nb, all_sc
+    new, f = pl.concat(news), pl.concat(feats)
+    print(f"[{log}] {new.height:,} new candidate pairs  {time.time() - t:.0f}s", flush=True)
+    if new.height:
+        # scored new pairs are cached: `python neighbors.py <split> --score` runs this as its
+        # own step, so the stage-2 process only reads the cache
+        path = config.work(f"{split}_nb_new.parquet")
+        if os.path.exists(path):
+            scored = pl.read_parquet(path).join(new, on=["q_rid", "e_rid"], how="semi")
+        else:
+            scored = _score_pairs(new, split)
+            scored.write_parquet(path)
+        sc = pl.concat([sc, scored.select(sc.columns)])
     print(f"[{log}] augmented: {sc.height:,} pairs  {time.time() - t:.0f}s", flush=True)
-    return sc, f.select("q_rid", "e_rid", *[c for c in NB_FEATURES]).with_columns(
-        [pl.col(c).cast(pl.Float32) for c in NB_FEATURES])
+    return sc, f
 
 
 if __name__ == "__main__":
@@ -144,3 +169,11 @@ if __name__ == "__main__":
         q = pl.read_parquet(config.work(f"{split}_records.parquet"), columns=["rid", "src"]).filter(
             pl.col("src") != 1).select(pl.col("rid").alias("q_rid"))
     search(split, q["q_rid"].unique().to_numpy(), log=f"nb-{split}")
+    if "--score" in sys.argv:  # also score the proposed new candidates (cached for augment)
+        if split == "train":
+            sc = pl.concat([pl.read_parquet(config.work(f + ".parquet")) for f in files], how="diagonal_relaxed")
+        else:
+            sc = pl.read_parquet(config.work("test_scores_s1.parquet"))
+        sc = sc.select(pl.read_parquet_schema(config.work(f"{split}_scores_s1.parquet" if split == "test"
+                                                           else "val_scores_s1.parquet")).names())
+        augment(sc.filter(pl.col("p") >= stage2.PRUNE), split, log=f"nb-{split}")
