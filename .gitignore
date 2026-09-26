@@ -6,3 +6,5 @@ output/
 *.parquet
 *.log
 work_v*/
+submission_package/
+submission.zip
