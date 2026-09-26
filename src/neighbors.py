@@ -41,7 +41,7 @@ import stage2
 from pipeline import LOAD_COLS
 
 K = 5            # neighbours per record
-N_CHUNKS = int(os.environ.get("ER_NB_CHUNKS", 6))  # index chunks over the S2/S3 pool (bounds memory)
+N_CHUNKS = int(os.environ.get("ER_NB_CHUNKS", 4))  # index chunks over the S2/S3 pool; train and test must match (per-chunk IDF)
 Q_CHUNK = 500_000
 NEW_MIN = 0.35   # similarity * neighbour p needed to propose a new candidate
 NEW_PER_Q = 2
