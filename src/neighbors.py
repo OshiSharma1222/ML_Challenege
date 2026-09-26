@@ -41,7 +41,7 @@ import stage2
 from pipeline import LOAD_COLS
 
 K = 5            # neighbours per record
-N_CHUNKS = 4     # index chunks over the S2/S3 pool (bounds memory)
+N_CHUNKS = int(os.environ.get("ER_NB_CHUNKS", 6))  # index chunks over the S2/S3 pool (bounds memory)
 Q_CHUNK = 500_000
 NEW_MIN = 0.35   # similarity * neighbour p needed to propose a new candidate
 NEW_PER_Q = 2
@@ -64,7 +64,10 @@ def search(split, qrids, log="nb"):
     rec = pl.read_parquet(config.work(f"{split}_records.parquet"), columns=_COLS)
     pool = rec.filter(pl.col("src") != 1)
     del rec
-    qs = pool.join(pl.DataFrame({"rid": np.asarray(qrids, dtype=np.uint32)}), on="rid", how="semi")
+    if len(qrids) >= pool.height:  # every record is a query: no second copy of the pool
+        qs = pool
+    else:
+        qs = pool.join(pl.DataFrame({"rid": np.asarray(qrids, dtype=np.uint32)}), on="rid", how="semi")
     bounds = np.linspace(0, pool.height, N_CHUNKS + 1).astype(int)
     best = None
     for c in range(N_CHUNKS):
