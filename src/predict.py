@@ -5,6 +5,7 @@ Outputs (tab-separated, one row per Source 1 test entity):
   output/candidate_pairs.tsv    source1_entity_id, candidate_entity_ids
 candidate_pairs is exactly the set of pairs the model scored.
 """
+import glob
 import json
 import os
 import sys
@@ -24,20 +25,25 @@ import stage2
 TAG = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--tag=')), '')
 
 
-def score(cand_path, qrids, rec, views, model, chunk_q=100_000, log="score"):
+def score(cand_path, qrids, rec, views, model, chunk_q=None, log="score"):
     """Stage-1 scoring streamed over contiguous query-rid ranges; keeps p >= PRUNE.
 
     Each chunk is checkpointed to work/test_s1_parts/, so an interrupted run resumes
-    where it stopped (the part files are keyed by chunk start and chunk size).
+    where it stopped (the part files are keyed by chunk start and chunk size). A rerun
+    may use another chunk size (ER_CHUNK_Q, smaller = less memory): chunks already
+    covered by a saved part are skipped, so sizes should divide one another.
     """
+    chunk_q = chunk_q or int(os.environ.get("ER_CHUNK_Q", 100_000))
     qrids = np.sort(qrids)
     lazy = pl.scan_parquet(cand_path)
     part_dir = config.work("test_s1_parts")
     os.makedirs(part_dir, exist_ok=True)
+    done = [tuple(int(x) for x in os.path.basename(f)[5:-8].split("_"))
+            for f in glob.glob(os.path.join(part_dir, "part_*_*.parquet"))]  # (size, start)
     t = time.time()
     for i in range(0, len(qrids), chunk_q):
         part = os.path.join(part_dir, f"part_{chunk_q}_{i:09d}.parquet")
-        if os.path.exists(part):
+        if any(s <= i and i + chunk_q <= s + n for n, s in done):
             continue
         lo, hi = int(qrids[i]), int(qrids[min(i + chunk_q, len(qrids)) - 1])
         pairs = lazy.filter(pl.col("q_rid").is_between(lo, hi)).collect()
@@ -54,7 +60,7 @@ def score(cand_path, qrids, rec, views, model, chunk_q=100_000, log="score"):
         del X, pairs, kept
         print(f"[{log}] {min(i + chunk_q, len(qrids)):,}/{len(qrids):,} queries, "
               f"{time.time() - t:.0f}s", flush=True)
-    return pl.read_parquet(os.path.join(part_dir, f"part_{chunk_q}_*.parquet"))
+    return pl.read_parquet(os.path.join(part_dir, "part_*_*.parquet"))
 
 
 def write_lists(s1, pairs, col, path):
