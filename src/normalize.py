@@ -171,6 +171,23 @@ IN_STATES = {
 }
 
 
+# France (test only): regions and their departments map to one region token, so that
+# "..., Dunkerque, Nord" and "..., Dunkerque, Hauts-de-France" agree like US/Indian states do
+FR_REGIONS = {
+    "hdf": ["hauts de france", "aisne", "nord", "oise", "pas de calais", "somme"],
+    "naq": ["nouvelle aquitaine", "charente", "charente maritime", "correze", "creuse", "dordogne",
+            "gironde", "landes", "lot et garonne", "pyrenees atlantiques", "deux sevres", "vienne",
+            "haute vienne"],
+    "pdl": ["pays de la loire", "loire atlantique", "maine et loire", "mayenne", "sarthe", "vendee"],
+    "idf": ["ile de france"], "ara": ["auvergne rhone alpes"], "bfc": ["bourgogne franche comte"],
+    "bre": ["bretagne"], "cvl": ["centre val de loire"], "cor": ["corse"], "ges": ["grand est"],
+    "nor": ["normandie"], "occ": ["occitanie"], "pac": ["provence alpes cote dazur", "paca"],
+}
+_FR_STATE = {n: "st_fr_" + c for c, names in FR_REGIONS.items() for n in names}
+# in French addresses "st"/"ste" are saint/sainte, not street/suite
+FR_ABBR = {"st": "saint", "ste": "sainte"}
+
+
 def _state_tables():
     code = {}      # exact component text -> canonical state token
     sk = {}        # despaced skeleton of full state name -> token
@@ -195,6 +212,8 @@ def state_of(component: str, country: str):
     c = component.strip()
     if not c:
         return None
+    if country == "france":
+        return _FR_STATE.get(c)
     ck = (country, c)
     if ck in _STATE_CODE:
         return _STATE_CODE[ck]
@@ -233,7 +252,7 @@ def addr_parts(raw, country: str):
             nums.append(w)
             toks.append(w)
             continue
-        w = ADDR_ABBR.get(w, w)
+        w = FR_ABBR[w] if cty == "france" and w in FR_ABBR else ADDR_ABBR.get(w, w)
         # mixed tokens like "9b", "a603", "12a" -> keep number part as a number too
         d = _DIGITS.findall(w)
         if d:
