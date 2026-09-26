@@ -31,6 +31,10 @@ PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_data_in
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
               num_threads=config.N_JOBS, verbose=-1)
 ROUNDS = 600
+# --big: a larger re-scorer (+0.0009 on the test-like check for the v5 stage-1 scores)
+if "--big" in sys.argv:
+    PARAMS = dict(PARAMS, num_leaves=255, learning_rate=0.03, min_data_in_leaf=200)
+    ROUNDS = 1200
 SHIFTS = (1.0, 0.7, 0.5, 0.35, 0.25)
 # --noent drops the entity-side context features, the only ones that change when an
 # entity is crowded by more confusers (test has ~2x as many per entity as train)

@@ -18,7 +18,7 @@ The main ideas behind the gains are:
 - a decision rule that optimises the macro F0.5 metric directly, rather than using one global threshold;
 - making the pipeline robust to the test set's higher density of look-alike records.
 
-Validation macro F0.5 is **0.9781** on the held-out entities, and **0.9755** on a check that simulates the test set's density of look-alike records.
+Validation macro F0.5 is **0.9784** on the held-out entities, and **0.9763** on a check that simulates the test set's density of look-alike records.
 
 ---
 
@@ -77,7 +77,7 @@ Validation macro F0.5 is **0.9781** on the held-out entities, and **0.9755** on 
    - extract house and street numbers.
 2. **Candidate generation** (`blocking.py`): see §3.
 3. **Stage 1** (`train.py`): a LightGBM pair classifier with 66 features.
-4. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 43 features, trained with 5-fold CV on held-out entities.
+4. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 39 features, trained with 5-fold CV on held-out entities.
 5. **Decision rule** (`decide.py`): expected-F0.5 optimisation per entity.
 
 ---
@@ -139,13 +139,14 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - **Within-query features:** for the key similarities, the gap to the best candidate of the same query and the rank within the query. Each query can match at most one entity, so its competitors are informative.
 - **Training:** 500k training queries (about 13 M labelled pairs). Settings: 255 leaves, learning rate 0.05, early stopping on the validation queries.
 
-### Stage 2: context re-scorer (LightGBM, 43 features)
+### Stage 2: context re-scorer (LightGBM, 39 features)
 
 - **Inputs:**
   - the stage-1 probability and its query context: gap to the query's best, maximum, sum, number of candidates above 0.1, rank;
   - key stage-1 similarities;
   - fine-grained features (`fine.py`): the IDF mass and length of name words not shared by the two sides (worst unmatched word on each side), legal words present on only one side, title-word differences, house-number equality and numeric distance, numbers present only on the entity side.
 - **Training data:** only entities whose stage-1 scores are out-of-sample. That means the stage-1 validation entities plus two further disjoint held-out sets (8% and 10% of Source 1 entities, `extend_val.py`), about 0.44 M entities in total. Training uses 5-fold cross-validation grouped by entity.
+- **Model settings:** 255 leaves, learning rate 0.03, 1,200 rounds. Growing it from 63 leaves / 600 rounds added +0.0008 on the test-like check. Averaging several random seeds added nothing, and averaging with the smaller models diluted the gain.
 - **Robust to crowding:** entity-side context features, which change when an entity has more look-alike records competing for it, are **excluded** (`--noent`). Because the remaining features are all query-side, the effect of test-like crowding can be simulated exactly: non-matching query rows are duplicated and the decision rule is re-scored.
 - **Prior-shift correction:** probabilities are rescaled by an odds multiplier r (p' = rp / (rp + 1 − p)). r is chosen on this test-like simulation, which gives r = 0.5.
 
@@ -166,9 +167,9 @@ This directly optimises the macro metric. A singleton entity drops from F = 1 to
 | Configuration | Validation macro F0.5 |
 |---|---|
 | Stage 1 only (global threshold) | 0.9692 |
-| + Stage 2 (global threshold) | 0.9783 |
-| + Stage 2, expected-F rule | **0.9781** |
-| Test-like simulation (2× confusers), expected-F rule, shift 0.5 | 0.9755 |
+| + Stage 2 (global threshold) | 0.9787 |
+| + Stage 2, expected-F rule | **0.9784** |
+| Test-like simulation (2× confusers), expected-F rule, shift 0.5 | 0.9763 |
 
 **Leaderboard (public):** 0.968 for the earlier versions. Final version: [fill in].
 
@@ -232,8 +233,8 @@ It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`:
 | Candidates | `blocking.py train`, `blocking.py test` | ~15–18 min each |
 | Stage 1 | `train.py 500000` | ~22 min |
 | Extra held-out scores | `extend_val.py 0.08`, `extend_val.py 0.10 --out=val3` | ~20 min each |
-| Stage 2 | `train_s2.py --ext=3 --noent --tag=_noent3` | ~23 min |
-| Test inference | `predict.py --tag=_noent3` | ~3 h |
+| Stage 2 | `train_s2.py --ext=3 --noent --big --tag=_big` | ~35 min |
+| Test inference | `predict.py --tag=_big` | ~3 h |
 
 The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 
@@ -253,4 +254,5 @@ The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 | Entity features, 2 held-out sets | 0.9728 |
 | No entity features, 2 sets | 0.9738 |
 | No entity features, 3 sets | 0.9739 |
-| + exact-spelling blocking (final) | **0.9755** |
+| + exact-spelling blocking | 0.9755 |
+| + larger stage-2 model, 255 leaves (final) | **0.9763** |

@@ -15,5 +15,5 @@ $PY blocking.py test                                  # ~15 min  candidate gener
 $PY train.py 500000                                   # ~22 min  stage-1 LightGBM + validation scores
 $PY extend_val.py 0.08                                # ~20 min  stage-1 scores, 2nd held-out entity set
 $PY extend_val.py 0.10 --out=val3                     # ~22 min  stage-1 scores, 3rd held-out entity set
-$PY train_s2.py --ext=3 --noent --tag=_noent3         # ~23 min  stage-2 re-scorer (CV) + decision rule
-$PY predict.py --tag=_noent3                          # ~3 h     test inference, writes output/
+$PY train_s2.py --ext=3 --noent --big --tag=_big      # ~35 min  stage-2 re-scorer (CV) + decision rule
+$PY predict.py --tag=_big                             # ~3 h     test inference, writes output/
