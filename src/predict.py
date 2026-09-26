@@ -20,6 +20,7 @@ import features as F
 from pipeline import load_records, assign
 import fine
 from decide import decide
+import neighbors
 import stage2
 
 TAG = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--tag=')), '')
@@ -93,11 +94,18 @@ def main():
         m2 = lgb.Booster(model_file=config.work(f"model_s2{TAG}.txt"))
         # stage-2 features depend only on the cached stage-1 scores, so they are cached too:
         # a retrained stage-2 model or a new decision rule then takes minutes, not a rebuild
-        fpath = config.work("test_s2_feats.parquet")
+        nb = "--nb" in sys.argv  # record-graph evidence and candidates (neighbors.py)
+        fpath = config.work("test_s2_feats_nb.parquet" if nb else "test_s2_feats.parquet")
         X2 = pl.read_parquet(fpath) if os.path.exists(fpath) else None
-        if X2 is None or not set(stage2.FEATURES) <= set(X2.columns):
+        if X2 is None or not set(m2.feature_name()) <= set(X2.columns):
+            nbf = None
+            if nb:
+                sc, nbf = neighbors.augment(sc, "test")
             X2 = stage2.build(sc, rec, fine.init_idf(s1["core_sk"]))
             X2 = X2.select("q_rid", "e_rid", *stage2.FEATURES)
+            if nbf is not None:
+                X2 = X2.join(nbf, on=["q_rid", "e_rid"], how="left").with_columns(
+                    [pl.col(c).fill_null(0) for c in neighbors.NB_FEATURES])
             X2.write_parquet(fpath)
         p = m2.predict(X2.select(m2.feature_name()).to_numpy().astype(np.float32),
                        num_threads=config.N_JOBS)

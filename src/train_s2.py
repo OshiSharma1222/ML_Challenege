@@ -19,6 +19,7 @@ import polars as pl
 
 import config
 import fine
+import neighbors
 import stage2
 from decide import decide
 from pipeline import load_records, gt_pairs, assign, f05_macro
@@ -40,6 +41,10 @@ SHIFTS = (1.0, 0.7, 0.5, 0.35, 0.25)
 # entity is crowded by more confusers (test has ~2x as many per entity as train)
 ENT = ["e_nwin_other", "e_psum", "e_rank", "e_pmax"]
 FEATS = [f for f in stage2.FEATURES if f not in ENT] if "--noent" in sys.argv else stage2.FEATURES
+# --nb adds the record-graph evidence (neighbors.py): neighbour votes and proposed candidates
+NB = "--nb" in sys.argv
+if NB:
+    FEATS = FEATS + neighbors.NB_FEATURES
 
 
 def with_copies(sc, gt, n):
@@ -50,7 +55,7 @@ def with_copies(sc, gt, n):
     return pl.concat([sc] + [un.with_columns(pl.col("q_rid") + base * (i + 1)) for i in range(n)])
 
 
-def build(sc, rec, idf, gt, val_e):
+def build(sc, rec, idf, gt, val_e, nbf=None):
     """Stage-2 feature matrix with label, CV fold (grouped by true entity / source query)."""
     copies = sc.filter(pl.col("q_rid") != pl.col("orig")).select("q_rid", "orig").unique()
     if copies.height:  # copied queries borrow their source query's record (name, numbers)
@@ -58,6 +63,9 @@ def build(sc, rec, idf, gt, val_e):
                          .drop("orig").rename({"q_rid": "rid"}).select(rec.columns)])
     X = stage2.build(sc.drop("orig"), rec, idf).join(sc.select("q_rid", "e_rid", "orig"),
                                                     on=["q_rid", "e_rid"])
+    if nbf is not None:  # copied queries carry their source query's neighbour evidence
+        X = X.join(nbf.rename({"q_rid": "orig"}), on=["orig", "e_rid"], how="left").with_columns(
+            [pl.col(c).fill_null(0) for c in neighbors.NB_FEATURES])
     X = (X.join(gt.rename({"true_e": "e_rid"}).with_columns(pl.lit(1, pl.Int8).alias("y")),
                 on=["q_rid", "e_rid"], how="left").with_columns(pl.col("y").fill_null(0)))
     tq = (X.select("q_rid", "orig").unique("q_rid")
@@ -101,10 +109,13 @@ def main():
             sc = pl.concat([sc, pl.read_parquet(config.work(f"{v}_scores_s1.parquet"))
                             .select(sc.columns)])
     sc = sc.filter(pl.col("p") >= stage2.PRUNE)
+    nbf = None
+    if NB:
+        sc, nbf = neighbors.augment(sc, "train")
     gt_all, gt_v0 = (gt.filter(pl.col("true_e").is_in(v.implode())) for v in (val_e, v0))
     s1_best = json.load(open(config.work("thr_stage1.json")))
 
-    base = build(with_copies(sc, gt, 0), rec, idf, gt, val_e)
+    base = build(with_copies(sc, gt, 0), rec, idf, gt, val_e, nbf)
     if not DUP:
         s2 = cv(base, base)
         s2.write_parquet(config.work(f"s2_oof{TAG}.parquet"))
@@ -132,7 +143,7 @@ def main():
         rule = "expf" if stage == 2 and ("--noent" in sys.argv or f_rule > best2[1]) else "thr"
         extra = {"f05_stage2": best2[1], "f05_stage2_expf": f_rule}
     else:
-        dup = build(with_copies(sc, gt, DUP), rec, idf, gt, val_e)
+        dup = build(with_copies(sc, gt, DUP), rec, idf, gt, val_e, nbf)
         del rec
         results = {}
         for name, train in (("A_trainlike", base), ("B_testlike", dup)):
