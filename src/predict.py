@@ -75,44 +75,67 @@ def write_lists(s1, pairs, col, path):
           f"{(out[col] != '').sum():,} non-empty")
 
 
+def _stage2_nb(sc, nbf, rec, s1, m2, q_chunk=2_000_000):
+    """Stage-2 probabilities with record-graph features, built per chunk of queries.
+
+    The --noent stage-2 model only uses query-side features, which are exact within a chunk
+    that holds all of a query's pairs, so chunking bounds memory without changing the result.
+    """
+    idf = fine.init_idf(s1["core_sk"])
+    qids = sc["q_rid"].unique().sort()
+    parts = []
+    for i in range(0, len(qids), q_chunk):
+        inq = pl.col("q_rid").is_between(qids[i], qids[min(i + q_chunk, len(qids)) - 1])
+        X = (stage2.build(sc.filter(inq), rec, idf).select("q_rid", "e_rid", *stage2.FEATURES)
+             .join(nbf.filter(inq), on=["q_rid", "e_rid"], how="left")
+             .with_columns([pl.col(c).fill_null(0) for c in neighbors.NB_FEATURES]))
+        p = m2.predict(X.select(m2.feature_name()).to_numpy().astype(np.float32), num_threads=config.N_JOBS)
+        parts.append(X.select("q_rid", "e_rid").with_columns(pl.Series("p", p)))
+        del X
+        print(f"[stage2-nb] {min(i + q_chunk, len(qids)):,}/{len(qids):,} queries", flush=True)
+    return pl.concat(parts)
+
+
 def main():
     t = time.time()
+    cfg = json.load(open(config.work(f"final{TAG}.json")))
+    nb = "--nb" in sys.argv and cfg["stage"] == 2  # record-graph evidence (neighbors.py)
+    if nb:  # before loading the records: the graph step is the memory peak
+        sc, nbf = neighbors.augment(pl.read_parquet(config.work("test_scores_s1.parquet")), "test")
     rec = load_records("test")
     s1 = rec.filter(pl.col("src") == 1)
     global RIDS, EIDS
     RIDS, EIDS = rec["rid"], rec["entity_id"]
-    cfg = json.load(open(config.work(f"final{TAG}.json")))
-    if not os.path.exists(config.work("test_scores_s1.parquet")) or "--rescore" in sys.argv:
+    if not nb and (not os.path.exists(config.work("test_scores_s1.parquet")) or "--rescore" in sys.argv):
         views = F.SparseViews(s1)
         m1 = lgb.Booster(model_file=config.work("model_s1.txt"))
         qrids = rec.filter(pl.col("src") != 1)["rid"].to_numpy()
         sc = score(config.work("test_cand.parquet"), qrids, rec, views, m1, log="test-s1")
         sc.write_parquet(config.work("test_scores_s1.parquet"))
         del views
-    sc = pl.read_parquet(config.work("test_scores_s1.parquet"))
+    if not nb:
+        sc = pl.read_parquet(config.work("test_scores_s1.parquet"))
     if cfg["stage"] == 2:
         m2 = lgb.Booster(model_file=config.work(f"model_s2{TAG}.txt"))
-        # stage-2 features depend only on the cached stage-1 scores, so they are cached too:
-        # a retrained stage-2 model or a new decision rule then takes minutes, not a rebuild
-        nb = "--nb" in sys.argv  # record-graph evidence and candidates (neighbors.py)
-        fpath = config.work("test_s2_feats_nb.parquet" if nb else "test_s2_feats.parquet")
-        X2 = pl.read_parquet(fpath) if os.path.exists(fpath) else None
-        if X2 is None or not set(m2.feature_name()) <= set(X2.columns):
-            nbf = None
-            if nb:
-                sc, nbf = neighbors.augment(sc, "test")
-            X2 = stage2.build(sc, rec, fine.init_idf(s1["core_sk"]))
-            X2 = X2.select("q_rid", "e_rid", *stage2.FEATURES)
-            if nbf is not None:
-                X2 = X2.join(nbf, on=["q_rid", "e_rid"], how="left").with_columns(
-                    [pl.col(c).fill_null(0) for c in neighbors.NB_FEATURES])
-            X2.write_parquet(fpath)
-        p = m2.predict(X2.select(m2.feature_name()).to_numpy().astype(np.float32),
-                       num_threads=config.N_JOBS)
         r = cfg.get("shift", 1.0)  # prior shift: odds multiplier for test's confuser density
-        p = r * p / (r * p + 1 - p)
-        sc = X2.select("q_rid", "e_rid").with_columns(pl.Series("p", p))
-        del X2
+        if nb:
+            sc = _stage2_nb(sc, nbf, rec, s1, m2)
+            del nbf
+            sc = sc.with_columns((r * pl.col("p") / (r * pl.col("p") + 1 - pl.col("p"))).alias("p"))
+        else:
+            # stage-2 features depend only on the cached stage-1 scores, so they are cached too:
+            # a retrained stage-2 model or a new decision rule then takes minutes, not a rebuild
+            fpath = config.work("test_s2_feats.parquet")
+            X2 = pl.read_parquet(fpath) if os.path.exists(fpath) else None
+            if X2 is None or not set(m2.feature_name()) <= set(X2.columns):
+                X2 = stage2.build(sc, rec, fine.init_idf(s1["core_sk"]))
+                X2 = X2.select("q_rid", "e_rid", *stage2.FEATURES)
+                X2.write_parquet(fpath)
+            p = m2.predict(X2.select(m2.feature_name()).to_numpy().astype(np.float32),
+                           num_threads=config.N_JOBS)
+            p = r * p / (r * p + 1 - p)
+            sc = X2.select("q_rid", "e_rid").with_columns(pl.Series("p", p))
+            del X2
     pred = decide(sc) if cfg.get("rule") == "expf" else assign(sc, cfg["thr"])
     print(f"[predict] {pred.height:,} matched queries of {sc['q_rid'].n_unique():,} "
           f"(rule {cfg.get('rule', 'thr')}, thr {cfg['thr']}, shift {cfg.get('shift', 1.0)}, "
