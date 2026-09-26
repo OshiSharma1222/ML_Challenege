@@ -11,6 +11,7 @@ Source 1 records by cosine similarity (sparse_dot_topn, multithreaded).
 Because each S2/S3 record belongs to at most one S1 entity, blocking is
 query-centric: K candidates per S2/S3 record.
 """
+import os
 import sys
 import time
 
@@ -25,6 +26,9 @@ from normalize import skeleton, ADDR_GENERIC
 MAX_DF = 3000  # tokens more frequent than this in S1 are dropped from the index
 K_FULL = 20    # candidates per query from the name+address index
 K_NAME = 10    # candidates per query from the name-only index
+# exact-spelling name words next to the skeletons: the skeleton merges distinct names
+# ("sweven", "seven", "shivam" -> "svn"), which crowds the true entity out of the top K
+RAW_NAME = os.environ.get("ER_BLOCK_RAW", "0") == "1"
 
 
 def _skel_map(words: pl.Series) -> pl.DataFrame:
@@ -68,11 +72,22 @@ def tokenize(df: pl.DataFrame, with_addr=True) -> pl.DataFrame:
     return pl.concat(parts).unique(["rid", "tok"])
 
 
+def block_tokens(df: pl.DataFrame, with_addr=True) -> pl.DataFrame:
+    """Blocking tokens: tokenize() plus, with RAW_NAME, exact name words and word pairs."""
+    toks = tokenize(df, with_addr)
+    if not RAW_NAME:
+        return toks
+    rw = _words(df.select("rid", pl.col("country").str.to_lowercase().alias("cty"), "core"),
+                "core").with_columns(pl.col("w").alias("sk"))
+    return pl.concat([toks, rw.select("rid", (pl.col("cty") + "|r|" + pl.col("w")).alias("tok")),
+                      _bigrams(rw, "|s|")]).unique(["rid", "tok"])
+
+
 class Index:
     def __init__(self, s1: pl.DataFrame, with_addr=True):
         t = time.time()
         self.with_addr = with_addr
-        toks = tokenize(s1, with_addr)
+        toks = block_tokens(s1, with_addr)
         n1 = s1.height
         df = toks.group_by("tok").agg(pl.len().alias("df")).filter(pl.col("df") <= MAX_DF)
         df = df.with_columns((np.log(n1 + 1) - pl.col("df").cast(pl.Float64).log()).alias("w"))
@@ -94,7 +109,7 @@ class Index:
         return sp.diags(1 / norm).dot(M).tocsr().astype(np.float32)
 
     def query(self, q: pl.DataFrame, k: int, threads: int, tag: str):
-        toks = tokenize(q, self.with_addr)
+        toks = block_tokens(q, self.with_addr)
         rid2row = pl.DataFrame({"rid": q["rid"].to_numpy(),
                                 "row": np.arange(q.height, dtype=np.uint32)})
         Q = self._matrix(toks, rid2row, q.height)

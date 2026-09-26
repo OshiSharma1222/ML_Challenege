@@ -5,3 +5,4 @@ work/
 output/
 *.parquet
 *.log
+work_v*/
