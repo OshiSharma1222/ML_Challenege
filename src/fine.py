@@ -4,13 +4,16 @@ Targeted at "confuser" records: same address as a real entity but one name word
 swapped, a nearby house number, or a different legal form.
 """
 import math
+import os
 import re
 from collections import Counter
 
 import numpy as np
+from rapidfuzz.distance import Levenshtein
 import polars as pl
 from rapidfuzz import fuzz
 
+import config
 from normalize import LEGAL, skeleton
 
 # transliterated abbreviations of legal words ("प्रा. लि." -> "pra li")
@@ -77,6 +80,46 @@ def _nums(s):
     return [int(x) for x in (s or "").split() if x.isdigit() and len(x) < 10]
 
 
+def _hn_edit(nq, ne):
+    """How the query's first house number differs from the entity's, as an edit type.
+
+    Record noise makes typo-like edits (a digit dropped or added: 7012 -> 702, ~90% true
+    matches in validation), while look-alike businesses shift the number arithmetically
+    (2611 -> 2623, ~21%): the numeric gap alone points the wrong way for both.
+    """
+    sq = [x for x in (nq or "").split() if x.isdigit()]
+    se = [x for x in (ne or "").split() if x.isdigit()]
+    if not sq or not se:
+        return (-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)
+    a, b = sq[0].lstrip("0") or "0", se[0].lstrip("0") or "0"
+    ed = Levenshtein.distance(a, b)
+    led = min(Levenshtein.distance(a, x.lstrip("0") or "0") for x in se)
+    same = len(a) == len(b)
+    shift = float(ed > 1 and len(a) < 10 and len(b) < 10 and abs(int(a) - int(b)) <= 20)
+    return (float(ed), float(led), float(abs(len(a) - len(b)) == 1 and ed == 1),
+            float(same and ed == 1), shift, float(same and a != b and sorted(a) == sorted(b)))
+
+
+_XW = None  # extra-word match rates (xwords.py): {"q": {word: rate}, "e": {word: rate}}
+
+
+def _load_xwords():
+    global _XW
+    if _XW is None:
+        path = config.work("xword_rates.parquet")
+        _XW = {"q": {}, "e": {}}
+        if os.path.exists(path):
+            for w, side, rate in pl.read_parquet(path).select("w", "side", "rate").iter_rows():
+                _XW[side][w] = rate
+
+
+def _xw(extra, side):
+    """(min rate, max rate, number of unknown words) for one side's extra name words."""
+    rates = [_XW[side][w] for w in extra if w in _XW[side]]
+    unk = float(len(extra) - len(rates))
+    return (min(rates), max(rates), unk) if rates else (-1.0, -1.0, unk)
+
+
 def _legal_toks(full):
     return {w for w in _W.findall(full or "") if w in LEGAL or w in LEGAL_EXTRA}
 
@@ -103,13 +146,17 @@ def _one(r):
     else:
         hn = (-1.0, -1.0, -1.0, float(len(Ne)))
     return (*uq, *ue, first_eq, float(len(lq - le)), float(len(le - lq)),
-            float(len(tq ^ te)), float(bool(tq & te)), *hn)
+            float(len(tq ^ te)), float(bool(tq & te)), *hn, *_hn_edit(nq, ne),
+            *_xw(set(cq.split() if cq else ()) - set(ce.split() if ce else ()), "q"),
+            *_xw(set(ce.split() if ce else ()) - set(cq.split() if cq else ()), "e"))
 
 
 FINE = ["fq_un", "fq_unidf", "fq_unfrac", "fq_unlen", "fq_worst",
         "fe_un", "fe_unidf", "fe_unfrac", "fe_unlen", "fe_worst",
         "f_first_eq", "f_legal_qonly", "f_legal_eonly", "f_title_diff", "f_title_shared",
-        "f_hn_eq", "f_hn_dmin", "f_hn_dfirst", "f_num_eonly"]
+        "f_hn_eq", "f_hn_dmin", "f_hn_dfirst", "f_num_eonly",
+        "f_hn_ed", "f_hn_led", "f_hn_drop", "f_hn_1dig", "f_hn_shift", "f_hn_swap",
+        "f_xq_min", "f_xq_max", "f_xq_unk", "f_xe_min", "f_xe_max", "f_xe_unk"]
 
 
 def build(pairs: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
@@ -121,6 +168,7 @@ def build(pairs: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
          .join(rec.select(cols).rename({c: c + "_e" for c in cols}), left_on="e_rid",
                right_on="rid_e", how="left"))
     _set_idf(*idf)
+    _load_xwords()
     # batched so only 500k pairs are ever held as Python objects (10M+ at once exhausts RAM)
     arr = np.empty((P.height, len(FINE)), dtype=np.float32)
     for s in range(0, P.height, 500_000):
