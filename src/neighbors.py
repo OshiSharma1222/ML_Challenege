@@ -90,16 +90,24 @@ def search(split, qrids, log="nb"):
             os.replace(parts[i] + ".tmp", parts[i])
         del idx
         print(f"[{log}] chunk {c + 1}/{N_CHUNKS} searched  {time.time() - t:.0f}s", flush=True)
+    qids = qs["rid"].sort()
     del pool, qs
-    lazy = pl.scan_parquet(os.path.join(part_dir, "*.parquet"))
-    qids = lazy.select("q_rid").unique().collect()["q_rid"].sort()
-    out = []
-    for i in range(0, len(qids), 1_000_000):  # top-K over all index chunks, per range of queries
-        lo, hi = qids[i], qids[min(i + 1_000_000, len(qids)) - 1]
-        out.append(lazy.filter(pl.col("q_rid").is_between(lo, hi)).collect()
-                   .sort("s", descending=True).group_by("q_rid", maintain_order=True).head(K))
-    nb = pl.concat(out).with_columns(pl.col("s").rank("ordinal", descending=True).over("q_rid")
-                                     .cast(pl.UInt8).alias("r_rank"))
+    # top-K over all index chunks, one range of queries at a time; each finished range goes to
+    # disk, so only one range is ever held in memory
+    lazy = pl.scan_parquet(os.path.join(part_dir, "c*.parquet"))
+    merged = []
+    for i in range(0, len(qids), 500_000):
+        out = os.path.join(part_dir, f"m_{i:09d}.parquet")
+        merged.append(out)
+        if os.path.exists(out):
+            continue
+        lo, hi = qids[i], qids[min(i + 500_000, len(qids)) - 1]
+        (lazy.filter(pl.col("q_rid").is_between(lo, hi)).collect()
+         .sort("s", descending=True).group_by("q_rid", maintain_order=True).head(K)
+         .with_columns(pl.col("s").rank("ordinal", descending=True).over("q_rid").cast(pl.UInt8).alias("r_rank"))
+         .write_parquet(out + ".tmp"))
+        os.replace(out + ".tmp", out)
+    nb = pl.read_parquet(merged)
     print(f"[{log}] {nb.height:,} links  {time.time() - t:.0f}s", flush=True)
     nb.write_parquet(path)
     return nb
