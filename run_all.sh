@@ -17,6 +17,7 @@ $PY extend_val.py 0.08                                # ~20 min  stage-1 scores,
 $PY extend_val.py 0.10 --out=val3                     # ~22 min  stage-1 scores, 3rd held-out entity set
 $PY predict.py --s1-only                              # ~2.5 h   stage-1 scores for all test pairs
 $PY neighbors.py train --score                        # ~35 min  record graph on the held-out sets
-$PY train_s2.py --ext=3 --noent --big --nb --tag=_nb2 # ~50 min  stage-2 re-scorer (CV) + decision rule
+$PY xwords.py                                         # ~1 min   fingerprint tables (extra-word match rates)
+$PY train_s2.py --ext=3 --noent --big --nb --tag=_nb4 # ~50 min  stage-2 re-scorer (CV) + decision rule
 $PY neighbors.py test --score                         # ~50 min  record graph on test
-$PY predict.py --tag=_nb2 --nb                        # ~30 min  test inference, writes output/
+$PY predict.py --tag=_nb4 --nb                        # ~1 h     test inference, writes output/

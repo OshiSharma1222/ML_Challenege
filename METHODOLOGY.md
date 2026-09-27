@@ -17,9 +17,10 @@ The main ideas behind the gains are:
 - a stage-2 model trained on out-of-sample stage-1 scores, from three disjoint held-out entity sets;
 - a decision rule that optimises the macro F0.5 metric directly, rather than using one global threshold;
 - making the pipeline robust to the test set's higher density of look-alike records;
-- a record graph: sibling records of one business in Source 2 and Source 3 vote for their entity, and the cluster's consensus on house number and name words separates true matches from look-alike businesses.
+- a record graph: sibling records of one business in Source 2 and Source 3 vote for their entity, and the cluster's consensus on house number and name words separates true matches from look-alike businesses;
+- generator fingerprints: *how* a record differs from its entity (the kind of house-number edit, which words were added) tells record noise from a look-alike business.
 
-Validation macro F0.5 is **0.9807** on the held-out entities, and **0.9782** on a check that simulates the test set's density of look-alike records.
+Validation macro F0.5 is **0.9815** on the held-out entities, and **0.9795** on a check that simulates the test set's density of look-alike records.
 
 ---
 
@@ -80,7 +81,7 @@ Validation macro F0.5 is **0.9807** on the held-out entities, and **0.9782** on 
 2. **Candidate generation** (`blocking.py`): see §3.
 3. **Stage 1** (`train.py`): a LightGBM pair classifier with 66 features.
 4. **Record graph** (`neighbors.py`): the 5 most similar other Source 2/3 records of every query, their votes, new candidates they propose, and cluster-consensus features.
-5. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 51 features, trained with 5-fold CV on held-out entities.
+5. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 63 features (including the generator-fingerprint features of `fine.py` / `xwords.py`), trained with 5-fold CV on held-out entities.
 6. **Decision rule** (`decide.py`): expected-F0.5 optimisation per entity.
 
 ---
@@ -142,7 +143,7 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - **Within-query features:** for the key similarities, the gap to the best candidate of the same query and the rank within the query. Each query can match at most one entity, so its competitors are informative.
 - **Training:** 500k training queries (about 13 M labelled pairs). Settings: 255 leaves, learning rate 0.05, early stopping on the validation queries.
 
-### Stage 2: context re-scorer (LightGBM, 51 features)
+### Stage 2: context re-scorer (LightGBM, 63 features)
 
 - **Inputs:**
   - the stage-1 probability and its query context: gap to the query's best, maximum, sum, number of candidates above 0.1, rank;
@@ -178,6 +179,23 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 Features: the number of close neighbours, how many share the entity's and the query's house number, and the share of each side's extra name words found in the neighbours.
 
 
+### Generator fingerprints (`fine.py`, `xwords.py`)
+
+Look-alike businesses and noisy true records are produced by different recipes, and *how* a record differs from its entity reveals which one it is. On held-out pairs:
+
+| How the query differs | True-match rate |
+|---|---|
+| House number: one digit dropped or added (7012 → 702) | 90% |
+| House number: small arithmetic shift, more than one digit edited (2611 → 2623) | 21% |
+| Only extra name word is "center" / "services" / a typo or transliteration | 85–95% |
+| Only extra name word is "enterprises", "trading", "group", "holdings", "exports", "west", "india"… | 0–3% |
+
+The numeric gap between house numbers points the wrong way for both of the first rows, which is why edit-type features help. Stage 2 gets:
+- the house-number edit type (edit distance, dropped/added digit, one digit changed, arithmetic shift, swapped digits);
+- for the words one side has and the other lacks, the lowest and highest learned match rate of those words, per side.
+
+The word rates come from close stage-1 training pairs, which are disjoint from the held-out entities stage 2 learns and is validated on, so the features do not see their own labels.
+
 ### Decision rule (threshold selection)
 
 1. Each Source 2/3 record keeps only its best Source 1 candidate.
@@ -198,8 +216,9 @@ This directly optimises the macro metric. A singleton entity drops from F = 1 to
 | + Stage 2 (global threshold) | 0.9787 |
 | + Stage 2, expected-F rule | 0.9784 |
 | + record graph (votes, new candidates) | 0.9799 |
-| + cluster consensus, expected-F rule (final) | **0.9807** |
-| Test-like simulation (2× confusers), expected-F rule, shift 0.5 (final) | 0.9782 |
+| + cluster consensus, expected-F rule | 0.9807 |
+| + generator fingerprints, expected-F rule (final) | **0.9815** |
+| Test-like simulation (2× confusers), expected-F rule, shift 0.5 (final) | 0.9795 |
 
 **Leaderboard (public):** 0.968 for the earlier versions. Final version: [fill in].
 
@@ -265,9 +284,10 @@ It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`:
 | Stage 1 | `train.py 500000` | ~22 min |
 | Extra held-out scores | `extend_val.py 0.08`, `extend_val.py 0.10 --out=val3` | ~20 min each |
 | Record graph (train) | `neighbors.py train --score` | ~35 min |
-| Stage 2 | `train_s2.py --ext=3 --noent --big --nb --tag=_nb2` | ~50 min |
+| Fingerprint tables | `xwords.py` | ~1 min |
+| Stage 2 | `train_s2.py --ext=3 --noent --big --nb --tag=_nb4` | ~50 min |
 | Record graph (test) | `neighbors.py test --score` | ~50 min |
-| Test inference | `predict.py --tag=_nb2 --nb` (stage-1 test scores are computed first if missing) | ~3.5 h |
+| Test inference | `predict.py --tag=_nb4 --nb` (after `predict.py --s1-only` for the stage-1 test scores) | ~1 h |
 
 The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 
@@ -290,4 +310,5 @@ The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 | + exact-spelling blocking | 0.9755 |
 | + larger stage-2 model, 255 leaves | 0.9763 |
 | + record graph: neighbour votes and proposed candidates | 0.9775 |
-| + cluster-consensus features (final) | **0.9782** |
+| + cluster-consensus features | 0.9782 |
+| + generator fingerprints: house-number edit type, extra-word match rates (final) | **0.9795** |
