@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** HashMap  
+**Team Members:** Oshi Sharma (leader), Dhairya, Bharat  
 **Submission Date:** 27 September 2026
 
 ---
@@ -20,7 +20,7 @@ The main ideas behind the gains are:
 - a record graph: sibling records of one business in Source 2 and Source 3 vote for their entity, and the cluster's consensus on house number and name words separates true matches from look-alike businesses;
 - generator fingerprints: *how* a record differs from its entity (the kind of house-number edit, which words were added) tells record noise from a look-alike business.
 
-Validation macro F0.5 is **0.9820** on the held-out entities, and **0.9798** on a check that simulates the test set's density of look-alike records.
+Validation macro F0.5 is **0.9815** on the held-out entities, and **0.9795** on a check that simulates the test set's density of look-alike records.
 
 ---
 
@@ -80,8 +80,8 @@ Validation macro F0.5 is **0.9820** on the held-out entities, and **0.9798** on 
    - extract house and street numbers.
 2. **Candidate generation** (`blocking.py`): see §3.
 3. **Stage 1** (`train.py`): a LightGBM pair classifier with 66 features.
-4. **Record graph** (`neighbors.py`): the 10 most similar other Source 2/3 records of every query, their votes, new candidates they propose, and cluster-consensus features.
-5. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 66 features (including the generator-fingerprint features of `fine.py` / `xwords.py`), trained with 5-fold CV on held-out entities.
+4. **Record graph** (`neighbors.py`): the 5 most similar other Source 2/3 records of every query, their votes, new candidates they propose, and cluster-consensus features.
+5. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 63 features (including the generator-fingerprint features of `fine.py` / `xwords.py`), trained with 5-fold CV on held-out entities.
 6. **Decision rule** (`decide.py`): expected-F0.5 optimisation per entity.
 
 ---
@@ -107,8 +107,9 @@ Validation macro F0.5 is **0.9820** on the held-out entities, and **0.9798** on 
 Tokens found in more than 3,000 Source 1 records are dropped from the index to keep the product sparse.
 
 **Candidate pairs generated:**
-- **train:** 254 M (24.6 per query);
-- **test:** 248 M (24.9 per query).
+- **blocking output:** 248 M test pairs (24.9 per Source 2/3 record); train 254 M (24.6 per query);
+- **final candidate set fed to the matching model** (`candidate_pairs.tsv`): after stage 1 drops pairs below p = 0.001 and the record graph adds its proposals, **15.6 M pairs = 9.0 candidates per Source 1 entity** (median 7), out of 9.97 M Source 2/3 records, i.e. a reduction ratio of 99.9999% versus all 1.7 × 10¹³ pairs.
+- A wider graph (10 neighbours) raised validation F0.5 by only +0.0003 while growing the set to 15.6 candidates per entity, so the smaller configuration was kept.
 
 **Keeping true matches.**
 - **Recall:** on a 300k-query training sample, 97.68% of true pairs are among the candidates.
@@ -143,7 +144,7 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - **Within-query features:** for the key similarities, the gap to the best candidate of the same query and the rank within the query. Each query can match at most one entity, so its competitors are informative.
 - **Training:** 500k training queries (about 13 M labelled pairs). Settings: 255 leaves, learning rate 0.05, early stopping on the validation queries.
 
-### Stage 2: context re-scorer (LightGBM, 66 features)
+### Stage 2: context re-scorer (LightGBM, 63 features)
 
 - **Inputs:**
   - the stage-1 probability and its query context: gap to the query's best, maximum, sum, number of candidates above 0.1, rank;
@@ -158,7 +159,7 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 
 **Why.** Records of one business in Source 2 and Source 3 often carry the *same* corruption: a transliterated name ("phst phainans praivet limited" in both sources for "First Finance Private Limited"), a joined-up web name, a truncated address. So a record that is hard to match to Source 1 is often very similar to a sibling record that matches easily. Of the true pairs missed by candidate generation, 43% have a sibling at token-set similarity ≥ 90.
 
-**Links.** Every Source 2/3 record is linked to its 10 most similar *other* Source 2/3 records, with the same sparse TF-IDF tokens as blocking. The index over the ~10 M records is built in 4 chunks to bound memory.
+**Links.** Every Source 2/3 record is linked to its 5 most similar *other* Source 2/3 records, with the same sparse TF-IDF tokens as blocking. The index over the ~10 M records is built in 4 chunks to bound memory.
 
 **Votes.** Each neighbour votes with its own stage-1 probabilities. For a pair (record q, entity e) this gives:
 - the closest neighbour's probability for e;
@@ -167,7 +168,7 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - the similarity of the closest neighbour;
 - the gap to the best-voted other candidate of q.
 
-**New candidates.** An entity voted for with similarity × probability ≥ 0.25 but absent from q's candidates is added (at most 3 per record). It is scored by the stage-1 model like any other pair, so records that blocking missed can still be matched through their siblings.
+**New candidates.** An entity voted for with similarity × probability ≥ 0.35 but absent from q's candidates is added (at most 2 per record). It is scored by the stage-1 model like any other pair, so records that blocking missed can still be matched through their siblings.
 
 **Cluster consensus.** The hardest errors are look-alike businesses: a near-copy of an entity with a slightly different house number (702 vs 7012) and an extra or changed name word. A look-alike is a separate business with its *own* records, which agree with each other, while noise in a true match is random per record. So for a pair whose house numbers differ, it matters which side the record's close neighbours (similarity ≥ 0.5) agree with. On uncertain held-out pairs with differing house numbers (42.5% true matches overall):
 
@@ -217,9 +218,8 @@ This directly optimises the macro metric. A singleton entity drops from F = 1 to
 | + Stage 2, expected-F rule | 0.9784 |
 | + record graph (votes, new candidates) | 0.9799 |
 | + cluster consensus, expected-F rule | 0.9807 |
-| + generator fingerprints, expected-F rule | 0.9815 |
-| + wider record graph (10 neighbours, more proposals), expected-F rule (final) | **0.9820** |
-| Test-like simulation (2× confusers), expected-F rule, shift 0.7 (final) | 0.9798 |
+| + generator fingerprints, expected-F rule (final) | **0.9815** |
+| Test-like simulation (2× confusers), expected-F rule, shift 0.5 (final) | 0.9795 |
 
 **Leaderboard (public):** 0.968 for the earlier versions. Final version: [fill in].
 
@@ -286,11 +286,11 @@ It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`:
 | Extra held-out scores | `extend_val.py 0.08`, `extend_val.py 0.10 --out=val3` | ~20 min each |
 | Record graph (train) | `neighbors.py train --score` | ~35 min |
 | Fingerprint tables | `xwords.py` | ~1 min |
-| Stage 2 | `train_s2.py --ext=3 --noent --big --nb --tag=_nb6` | ~60 min |
+| Stage 2 | `train_s2.py --ext=3 --noent --big --nb --tag=_nb4` | ~50 min |
 | Record graph (test) | `neighbors.py test --score` | ~50 min |
-| Test inference | `predict.py --tag=_nb6 --nb` (or `--stream` for low memory), after `predict.py --s1-only` for the stage-1 test scores | ~40 min |
+| Test inference | `predict.py --tag=_nb4 --nb` (or `--stream` for low memory), after `predict.py --s1-only` for the stage-1 test scores | ~40 min |
 
-The record-graph steps run with `ER_NB_K=10 ER_NB_NEW_MIN=0.25 ER_NB_NEW_PER_Q=3` (set in `run_all.sh`). The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
+The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 
 ### B. Additional Results
 
@@ -312,5 +312,4 @@ The record-graph steps run with `ER_NB_K=10 ER_NB_NEW_MIN=0.25 ER_NB_NEW_PER_Q=3
 | + larger stage-2 model, 255 leaves | 0.9763 |
 | + record graph: neighbour votes and proposed candidates | 0.9775 |
 | + cluster-consensus features | 0.9782 |
-| + generator fingerprints: house-number edit type, extra-word match rates | 0.9795 |
-| + wider record graph: 10 neighbours, proposal bar 0.25, up to 3 proposals (final) | **0.9798** |
+| + generator fingerprints: house-number edit type, extra-word match rates (final) | **0.9795** |
