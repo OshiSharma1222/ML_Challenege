@@ -195,6 +195,17 @@ def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
     bound memory.
     """
     t = time.time()
+    # finished graph features are cached too (written by `neighbors.py <split> --score`), so the
+    # stage-2 process never holds the links, record keys and votes; delete the cache after
+    # changing the graph features
+    fpath = config.work(f"{split}_nb_feat{_TAG}.parquet")
+    npath = config.work(f"{split}_nb_new{_TAG}.parquet")
+    if os.path.exists(fpath) and os.path.exists(npath):
+        f = pl.read_parquet(fpath)
+        scored = pl.read_parquet(npath).join(sc.select("q_rid", "e_rid"), on=["q_rid", "e_rid"], how="anti")
+        sc = pl.concat([sc, scored.select(sc.columns)])
+        print(f"[{log}] cached graph features: {sc.height:,} pairs  {time.time() - t:.0f}s", flush=True)
+        return sc, f
     all_sc = (sc if all_sc is None else all_sc).select(pl.col("q_rid").alias("r_rid"), "e_rid", "p")
     qids = sc["q_rid"].unique().sort()
     nb = search(split, qids.to_numpy(), log).join(pl.DataFrame({"q_rid": qids}), on="q_rid", how="semi")
@@ -212,13 +223,13 @@ def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
     if new.height:
         # scored new pairs are cached: `python neighbors.py <split> --score` runs this as its
         # own step, so the stage-2 process only reads the cache
-        path = config.work(f"{split}_nb_new{_TAG}.parquet")
-        if os.path.exists(path):
-            scored = pl.read_parquet(path).join(new, on=["q_rid", "e_rid"], how="semi")
+        if os.path.exists(npath):
+            scored = pl.read_parquet(npath).join(new, on=["q_rid", "e_rid"], how="semi")
         else:
             scored = _score_pairs(new, split)
-            scored.write_parquet(path)
+            scored.write_parquet(npath)
         sc = pl.concat([sc, scored.select(sc.columns)])
+    f.write_parquet(fpath)
     print(f"[{log}] augmented: {sc.height:,} pairs  {time.time() - t:.0f}s", flush=True)
     return sc, f
 
