@@ -10,15 +10,16 @@
 
 We resolve Source 2 / Source 3 business records to Source 1 entities with a CPU-only, three-step pipeline:
 1. **Candidate generation:** a sparse TF-IDF top-K search over phonetic and exact-spelling name tokens and address tokens.
-2. **Scoring:** two LightGBM models. The first scores each candidate pair; the second re-scores it in the context of the record's other candidates.
+2. **Scoring:** two LightGBM models. The first scores each candidate pair; the second re-scores it in the context of the record's other candidates and of a **record graph** linking each Source 2/3 record to its most similar other Source 2/3 records.
 3. **Decision:** an entity-level rule that picks, for every Source 1 entity, the set of matches with the highest expected F0.5.
 
 The main ideas behind the gains are:
 - a stage-2 model trained on out-of-sample stage-1 scores, from three disjoint held-out entity sets;
 - a decision rule that optimises the macro F0.5 metric directly, rather than using one global threshold;
-- making the pipeline robust to the test set's higher density of look-alike records.
+- making the pipeline robust to the test set's higher density of look-alike records;
+- a record graph: sibling records of one business in Source 2 and Source 3 vote for their entity, and the cluster's consensus on house number and name words separates true matches from look-alike businesses.
 
-Validation macro F0.5 is **0.9784** on the held-out entities, and **0.9763** on a check that simulates the test set's density of look-alike records.
+Validation macro F0.5 is **0.9807** on the held-out entities, and **0.9782** on a check that simulates the test set's density of look-alike records.
 
 ---
 
@@ -66,6 +67,7 @@ Validation macro F0.5 is **0.9784** on the held-out entities, and **0.9763** on 
 - **Metric-aware decisions:** the final matches maximise expected per-entity F0.5, not a global threshold.
 - **Out-of-sample stage 2:** the stage-2 re-scorer is trained on out-of-sample stage-1 scores.
 - **Robustness to crowding:** entity-side context features are dropped, and a prior-shift correction is tuned on a validation set that simulates test's density of look-alike records.
+- **Record graph:** evidence from a record's siblings in the other source (§4, record graph).
 
 **The pipeline:**
 1. **Normalisation** (`normalize.py`, `prep.py`):
@@ -77,8 +79,9 @@ Validation macro F0.5 is **0.9784** on the held-out entities, and **0.9763** on 
    - extract house and street numbers.
 2. **Candidate generation** (`blocking.py`): see §3.
 3. **Stage 1** (`train.py`): a LightGBM pair classifier with 66 features.
-4. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 39 features, trained with 5-fold CV on held-out entities.
-5. **Decision rule** (`decide.py`): expected-F0.5 optimisation per entity.
+4. **Record graph** (`neighbors.py`): the 5 most similar other Source 2/3 records of every query, their votes, new candidates they propose, and cluster-consensus features.
+5. **Stage 2** (`train_s2.py`): a LightGBM re-scorer with 51 features, trained with 5-fold CV on held-out entities.
+6. **Decision rule** (`decide.py`): expected-F0.5 optimisation per entity.
 
 ---
 
@@ -139,7 +142,7 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - **Within-query features:** for the key similarities, the gap to the best candidate of the same query and the rank within the query. Each query can match at most one entity, so its competitors are informative.
 - **Training:** 500k training queries (about 13 M labelled pairs). Settings: 255 leaves, learning rate 0.05, early stopping on the validation queries.
 
-### Stage 2: context re-scorer (LightGBM, 39 features)
+### Stage 2: context re-scorer (LightGBM, 51 features)
 
 - **Inputs:**
   - the stage-1 probability and its query context: gap to the query's best, maximum, sum, number of candidates above 0.1, rank;
@@ -149,6 +152,31 @@ Tokens found in more than 3,000 Source 1 records are dropped from the index to k
 - **Model settings:** 255 leaves, learning rate 0.03, 1,200 rounds. Growing it from 63 leaves / 600 rounds added +0.0008 on the test-like check. Averaging several random seeds added nothing, and averaging with the smaller models diluted the gain.
 - **Robust to crowding:** entity-side context features, which change when an entity has more look-alike records competing for it, are **excluded** (`--noent`). Because the remaining features are all query-side, the effect of test-like crowding can be simulated exactly: non-matching query rows are duplicated and the decision rule is re-scored.
 - **Prior-shift correction:** probabilities are rescaled by an odds multiplier r (p' = rp / (rp + 1 − p)). r is chosen on this test-like simulation, which gives r = 0.5.
+
+### Record graph (`neighbors.py`)
+
+**Why.** Records of one business in Source 2 and Source 3 often carry the *same* corruption: a transliterated name ("phst phainans praivet limited" in both sources for "First Finance Private Limited"), a joined-up web name, a truncated address. So a record that is hard to match to Source 1 is often very similar to a sibling record that matches easily. Of the true pairs missed by candidate generation, 43% have a sibling at token-set similarity ≥ 90.
+
+**Links.** Every Source 2/3 record is linked to its 5 most similar *other* Source 2/3 records, with the same sparse TF-IDF tokens as blocking. The index over the ~10 M records is built in 4 chunks to bound memory.
+
+**Votes.** Each neighbour votes with its own stage-1 probabilities. For a pair (record q, entity e) this gives:
+- the closest neighbour's probability for e;
+- the maximum, the similarity-weighted maximum and the sum of the neighbours' probabilities for e;
+- the number of neighbours with probability > 0.5;
+- the similarity of the closest neighbour;
+- the gap to the best-voted other candidate of q.
+
+**New candidates.** An entity voted for with similarity × probability ≥ 0.35 but absent from q's candidates is added (at most 2 per record). It is scored by the stage-1 model like any other pair, so records that blocking missed can still be matched through their siblings.
+
+**Cluster consensus.** The hardest errors are look-alike businesses: a near-copy of an entity with a slightly different house number (702 vs 7012) and an extra or changed name word. A look-alike is a separate business with its *own* records, which agree with each other, while noise in a true match is random per record. So for a pair whose house numbers differ, it matters which side the record's close neighbours (similarity ≥ 0.5) agree with. On uncertain held-out pairs with differing house numbers (42.5% true matches overall):
+
+| Close neighbours agree with… | True-match rate |
+|---|---|
+| the entity's house number | 26% (the entity's real siblings exist and this record differs from them) |
+| the query's house number | 78% (the Source 1 record carries the corrupted number) |
+
+Features: the number of close neighbours, how many share the entity's and the query's house number, and the share of each side's extra name words found in the neighbours.
+
 
 ### Decision rule (threshold selection)
 
@@ -168,8 +196,10 @@ This directly optimises the macro metric. A singleton entity drops from F = 1 to
 |---|---|
 | Stage 1 only (global threshold) | 0.9692 |
 | + Stage 2 (global threshold) | 0.9787 |
-| + Stage 2, expected-F rule | **0.9784** |
-| Test-like simulation (2× confusers), expected-F rule, shift 0.5 | 0.9763 |
+| + Stage 2, expected-F rule | 0.9784 |
+| + record graph (votes, new candidates) | 0.9799 |
+| + cluster consensus, expected-F rule (final) | **0.9807** |
+| Test-like simulation (2× confusers), expected-F rule, shift 0.5 (final) | 0.9782 |
 
 **Leaderboard (public):** 0.968 for the earlier versions. Final version: [fill in].
 
@@ -200,11 +230,12 @@ The precision-weighted metric and the expected-F rule make the model decline the
 
 ## 6. Conclusion
 
-A carefully engineered sparse candidate search plus two gradient-boosted models reaches about 0.978 validation macro F0.5 on CPU only. The largest single gain came from the stage-2 context re-scorer trained on out-of-sample stage-1 scores (+0.009 over stage 1).
+A carefully engineered sparse candidate search, two gradient-boosted models and a record graph reach about 0.981 validation macro F0.5 on CPU only. The largest single gain came from the stage-2 context re-scorer trained on out-of-sample stage-1 scores (+0.009 over stage 1); the record graph and its cluster-consensus features added another +0.0023 (+0.0019 under test-like crowding).
 
 The main lessons:
 - The phonetic keys that make transliterated names match also merge distinct names. Pairing them with exact-spelling keys recovers recall at no cost.
 - A train/test shift in how many look-alike records compete for each entity is best handled with features that stay valid under it, plus an explicit prior-shift correction.
+- Records are not independent: siblings of one business across sources share corruptions, and a look-alike business reveals itself through its own consistent records.
 - The remaining error is dominated by records without an address and by native-script names. A multilingual text encoder is the natural next step there.
 
 ---
@@ -233,8 +264,10 @@ It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`:
 | Candidates | `blocking.py train`, `blocking.py test` | ~15–18 min each |
 | Stage 1 | `train.py 500000` | ~22 min |
 | Extra held-out scores | `extend_val.py 0.08`, `extend_val.py 0.10 --out=val3` | ~20 min each |
-| Stage 2 | `train_s2.py --ext=3 --noent --big --tag=_big` | ~35 min |
-| Test inference | `predict.py --tag=_big` | ~3 h |
+| Record graph (train) | `neighbors.py train --score` | ~35 min |
+| Stage 2 | `train_s2.py --ext=3 --noent --big --nb --tag=_nb2` | ~50 min |
+| Record graph (test) | `neighbors.py test --score` | ~50 min |
+| Test inference | `predict.py --tag=_nb2 --nb` (stage-1 test scores are computed first if missing) | ~3.5 h |
 
 The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 
@@ -255,4 +288,6 @@ The hardware used had 16 GB RAM and no GPU, so stages must run one at a time.
 | No entity features, 2 sets | 0.9738 |
 | No entity features, 3 sets | 0.9739 |
 | + exact-spelling blocking | 0.9755 |
-| + larger stage-2 model, 255 leaves (final) | **0.9763** |
+| + larger stage-2 model, 255 leaves | 0.9763 |
+| + record graph: neighbour votes and proposed candidates | 0.9775 |
+| + cluster-consensus features (final) | **0.9782** |

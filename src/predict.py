@@ -98,6 +98,15 @@ def _stage2_nb(sc, nbf, rec, s1, m2, q_chunk=2_000_000):
 
 def main():
     t = time.time()
+    if "--s1-only" in sys.argv:  # only compute and cache the stage-1 test scores
+        rec = load_records("test")
+        s1 = rec.filter(pl.col("src") == 1)
+        qrids = rec.filter(pl.col("src") != 1)["rid"].to_numpy()
+        m1 = lgb.Booster(model_file=config.work("model_s1.txt"))
+        score(config.work("test_cand.parquet"), qrids, rec, F.SparseViews(s1), m1,
+              log="test-s1").write_parquet(config.work("test_scores_s1.parquet"))
+        print(f"done {time.time() - t:.0f}s")
+        return
     cfg = json.load(open(config.work(f"final{TAG}.json")))
     nb = "--nb" in sys.argv and cfg["stage"] == 2  # record-graph evidence (neighbors.py)
     if nb:  # before loading the records: the graph step is the memory peak
