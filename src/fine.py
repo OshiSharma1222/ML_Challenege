@@ -100,6 +100,60 @@ def _hn_edit(nq, ne):
             float(same and ed == 1), shift, float(same and a != b and sorted(a) == sorted(b)))
 
 
+def hn_type(nq, ne):
+    """Category of how the first house numbers differ (for the diff signature)."""
+    sq = [x.lstrip("0") or "0" for x in (nq or "").split() if x.isdigit()]
+    se = [x.lstrip("0") or "0" for x in (ne or "").split() if x.isdigit()]
+    if not sq or not se:
+        return "none" if not sq and not se else ("noq" if not sq else "noe")
+    a, b = sq[0], se[0]
+    if a == b:
+        return "same"
+    ed = Levenshtein.distance(a, b)
+    if abs(len(a) - len(b)) == 1 and ed == 1:
+        return "drop"
+    if len(a) == len(b) and sorted(a) == sorted(b):
+        return "swap"
+    if len(a) == len(b) and ed == 1:
+        return "1dig"
+    if len(a) < 10 and len(b) < 10 and abs(int(a) - int(b)) <= 20:
+        return "shift"
+    return "inother" if a in se else "other"
+
+
+def signature(cq, ce, nq, ne, lq, le, cty):
+    """How a query differs from an entity, as (fine, coarse) category strings.
+
+    fine: country | house-number edit type | legal-form transition | words added | removed.
+    The match rate of each signature (xwords.py) models the generator's noise vs look-alike
+    recipes jointly, including combinations no single feature shows.
+    """
+    tq, te = set((cq or "").split()), set((ce or "").split())
+    ht = hn_type(nq, ne)
+    na, nr = min(len(tq - te), 2), min(len(te - tq), 2)
+    return (f"{cty}|{ht}|{lq or '-'}>{le or '-'}|a{na}|r{nr}", f"{ht}|a{na}|r{nr}")
+
+
+_SIG = None  # signature match rates (xwords.py): {"fine": {sig: (rate, n)}, "coarse": {...}}
+
+
+def _load_sigs():
+    global _SIG
+    if _SIG is None:
+        path = config.work("sig_rates.parquet")
+        _SIG = {"fine": {}, "coarse": {}}
+        if os.path.exists(path):
+            for sig, kind, rate, n in pl.read_parquet(path).select("sig", "kind", "rate", "n").iter_rows():
+                _SIG[kind][sig] = (rate, n)
+
+
+def _sig_feats(cq, ce, nq, ne, lq, le, cty):
+    fine_s, coarse_s = signature(cq, ce, nq, ne, lq, le, cty)
+    c = _SIG["coarse"].get(coarse_s, (-1.0, 0))[0]
+    f = _SIG["fine"].get(fine_s)
+    return (f[0], math.log1p(f[1]), c) if f else (c, 0.0, c)
+
+
 _XW = None  # extra-word match rates (xwords.py): {"q": {word: rate}, "e": {word: rate}}
 
 
@@ -129,7 +183,7 @@ def _title_toks(full):
 
 
 def _one(r):
-    cq, ce, fq, fe, nq, ne = r
+    cq, ce, fq, fe, nq, ne, lq, le, cty = r
     wq = [w for w in (cq or "").split() if w not in LEGAL_EXTRA]
     we = [w for w in (ce or "").split() if w not in LEGAL_EXTRA]
     uq = _align(wq, we)
@@ -148,7 +202,8 @@ def _one(r):
     return (*uq, *ue, first_eq, float(len(lq - le)), float(len(le - lq)),
             float(len(tq ^ te)), float(bool(tq & te)), *hn, *_hn_edit(nq, ne),
             *_xw(set(cq.split() if cq else ()) - set(ce.split() if ce else ()), "q"),
-            *_xw(set(ce.split() if ce else ()) - set(cq.split() if cq else ()), "e"))
+            *_xw(set(ce.split() if ce else ()) - set(cq.split() if cq else ()), "e"),
+            *_sig_feats(cq, ce, nq, ne, lq, le, cty))
 
 
 FINE = ["fq_un", "fq_unidf", "fq_unfrac", "fq_unlen", "fq_worst",
@@ -156,12 +211,13 @@ FINE = ["fq_un", "fq_unidf", "fq_unfrac", "fq_unlen", "fq_worst",
         "f_first_eq", "f_legal_qonly", "f_legal_eonly", "f_title_diff", "f_title_shared",
         "f_hn_eq", "f_hn_dmin", "f_hn_dfirst", "f_num_eonly",
         "f_hn_ed", "f_hn_led", "f_hn_drop", "f_hn_1dig", "f_hn_shift", "f_hn_swap",
-        "f_xq_min", "f_xq_max", "f_xq_unk", "f_xe_min", "f_xe_max", "f_xe_unk"]
+        "f_xq_min", "f_xq_max", "f_xq_unk", "f_xe_min", "f_xe_max", "f_xe_unk",
+        "f_sig_rate", "f_sig_logn", "f_sig2_rate"]
 
 
 def build(pairs: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
     """pairs: q_rid, e_rid. rec: records (rid, core, name_full, nums)."""
-    cols = ["rid", "core", "name_full", "nums"]
+    cols = ["rid", "core", "name_full", "nums", "legal", "country"]
     P = (pairs.select("q_rid", "e_rid")
          .join(rec.select(cols).rename({c: c + "_q" for c in cols}), left_on="q_rid",
                right_on="rid_q", how="left")
@@ -169,12 +225,14 @@ def build(pairs: pl.DataFrame, rec: pl.DataFrame, idf) -> pl.DataFrame:
                right_on="rid_e", how="left"))
     _set_idf(*idf)
     _load_xwords()
+    _load_sigs()
     # batched so only 500k pairs are ever held as Python objects (10M+ at once exhausts RAM)
     arr = np.empty((P.height, len(FINE)), dtype=np.float32)
     for s in range(0, P.height, 500_000):
         C = P.slice(s, 500_000)
         rows = zip(C["core_q"].to_list(), C["core_e"].to_list(), C["name_full_q"].to_list(),
-                   C["name_full_e"].to_list(), C["nums_q"].to_list(), C["nums_e"].to_list())
+                   C["name_full_e"].to_list(), C["nums_q"].to_list(), C["nums_e"].to_list(),
+                   C["legal_q"].to_list(), C["legal_e"].to_list(), C["country_q"].to_list())
         arr[s:s + C.height] = np.asarray([_one(r) for r in rows],
                                          dtype=np.float32).reshape(-1, len(FINE))
     return P.select("q_rid", "e_rid").with_columns(

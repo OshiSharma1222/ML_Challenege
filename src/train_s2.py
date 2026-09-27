@@ -96,7 +96,7 @@ def shifted(s2, r):
 
 def main():
     rec = load_records("train").select("rid", "entity_id", "src", "core", "core_sk",
-                                       "name_full", "nums")
+                                       "name_full", "nums", "legal", "country")
     gt = gt_pairs(rec)
     idf = fine.init_idf(rec.filter(pl.col("src") == 1)["core_sk"])
     val_e = pl.read_parquet(config.work("val_entities.parquet"))["rid"]

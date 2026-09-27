@@ -16,6 +16,7 @@ import time
 import polars as pl
 
 import config
+import fine
 from pipeline import load_records, gt_pairs
 
 MIN_COS = 0.6   # close pairs only: the rates are meant for the pairs stage 2 has to decide
@@ -52,7 +53,37 @@ def main():
         print(f"[xwords] {side}: {out[-1].height:,} words, prior {prior:.3f}", flush=True)
     tab = pl.concat(out)
     tab.write_parquet(config.work("xword_rates.parquet"))
+    sigs(pairs, rec, gt)
     print(f"[xwords] {pairs.height:,} pairs  done {time.time() - t:.0f}s")
+
+
+def sigs(pairs, rec, gt):
+    """Match rate of every diff signature (fine.signature) on the same close pairs."""
+    t = time.time()
+    r = load_records("train").select("rid", "core", "nums", "legal", "country")
+    P = (pairs.join(r.rename(lambda c: c + "_q"), left_on="q_rid", right_on="rid_q")
+         .join(r.rename(lambda c: c + "_e"), left_on="e_rid", right_on="rid_e")
+         .join(gt.rename({"true_e": "e_rid"}).with_columns(pl.lit(1, pl.Int8).alias("y")),
+               on=["q_rid", "e_rid"], how="left").with_columns(pl.col("y").fill_null(0)))
+    fs, cs = [], []
+    for row in zip(P["core_q"].to_list(), P["core_e"].to_list(), P["nums_q"].to_list(),
+                   P["nums_e"].to_list(), P["legal_q"].to_list(), P["legal_e"].to_list(),
+                   P["country_q"].to_list()):
+        f, c = fine.signature(*row)
+        fs.append(f)
+        cs.append(c)
+    P = P.select("y").with_columns(pl.Series("fine", fs), pl.Series("coarse", cs))
+    prior = float(P["y"].mean())
+    out = []
+    for kind in ("fine", "coarse"):
+        out.append(P.group_by(kind).agg(pl.len().alias("n"), pl.col("y").sum().alias("ys"))
+                   .filter(pl.col("n") >= MIN_N)
+                   .with_columns(((pl.col("ys") + SMOOTH * prior) / (pl.col("n") + SMOOTH))
+                                 .cast(pl.Float32).alias("rate"), pl.lit(kind).alias("kind"))
+                   .select(pl.col(kind).alias("sig"), "kind", "n", "rate"))
+        print(f"[sigs] {kind}: {out[-1].height:,} signatures", flush=True)
+    pl.concat(out).write_parquet(config.work("sig_rates.parquet"))
+    print(f"[sigs] prior {prior:.3f}  {time.time() - t:.0f}s", flush=True)
 
 
 if __name__ == "__main__":

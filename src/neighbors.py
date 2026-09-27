@@ -40,11 +40,14 @@ import features as F
 import stage2
 from pipeline import LOAD_COLS
 
-K = 5            # neighbours per record
+K = int(os.environ.get("ER_NB_K", 5))  # neighbours per record
 N_CHUNKS = int(os.environ.get("ER_NB_CHUNKS", 4))  # index chunks over the S2/S3 pool; train and test must match (per-chunk IDF)
 Q_CHUNK = 500_000
-NEW_MIN = 0.35   # similarity * neighbour p needed to propose a new candidate
-NEW_PER_Q = 2
+NEW_MIN = float(os.environ.get("ER_NB_NEW_MIN", 0.35))  # similarity * neighbour p to propose a new candidate
+NEW_PER_Q = int(os.environ.get("ER_NB_NEW_PER_Q", 2))
+# caches of other settings live in their own files, so the default caches stay valid
+_TAG = "" if (K, NEW_MIN, NEW_PER_Q) == (5, 0.35, 2) else f"_k{K}_m{NEW_MIN:g}_n{NEW_PER_Q}"
+_KTAG = "" if K == 5 else f"_k{K}"
 CLOSE = 0.5      # neighbour similarity counted as "same cluster" for the consensus features
 NB_FEATURES = ["nb_v1", "nb_vmax", "nb_vw", "nb_vsum", "nb_nv", "nb_s1", "nb_vgap",
                "nb_nclose", "nb_hn_e", "nb_hn_q", "nb_xq", "nb_xe"]
@@ -57,7 +60,7 @@ def search(split, qrids, log="nb"):
 
     Cached in work/{split}_nb.parquet (delete it to recompute for a different query set).
     """
-    path = config.work(f"{split}_nb.parquet")
+    path = config.work(f"{split}_nb{_KTAG}.parquet")
     if os.path.exists(path):
         return pl.read_parquet(path)
     t = time.time()
@@ -193,7 +196,7 @@ def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
     if new.height:
         # scored new pairs are cached: `python neighbors.py <split> --score` runs this as its
         # own step, so the stage-2 process only reads the cache
-        path = config.work(f"{split}_nb_new.parquet")
+        path = config.work(f"{split}_nb_new{_TAG}.parquet")
         if os.path.exists(path):
             scored = pl.read_parquet(path).join(new, on=["q_rid", "e_rid"], how="semi")
         else:
