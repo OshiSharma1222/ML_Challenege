@@ -36,7 +36,7 @@ ROUNDS = 600
 if "--big" in sys.argv:
     PARAMS = dict(PARAMS, num_leaves=255, learning_rate=0.03, min_data_in_leaf=200)
     ROUNDS = 1200
-SHIFTS = (1.0, 0.7, 0.5, 0.35, 0.25)
+SHIFTS = (0.7, 0.5)  # the best prior shift has always been one of these (1.0/0.35/0.25 never won)
 # --noent drops the entity-side context features, the only ones that change when an
 # entity is crowded by more confusers (test has ~2x as many per entity as train)
 ENT = ["e_nwin_other", "e_psum", "e_rank", "e_pmax"]
