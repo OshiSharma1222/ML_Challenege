@@ -75,7 +75,7 @@ def write_lists(s1, pairs, col, path):
           f"{(out[col] != '').sum():,} non-empty")
 
 
-def _stage2_nb(sc, nbf, rec, s1, m2, q_chunk=2_000_000):
+def _stage2_nb(sc, nbf, rec, s1, m2, q_chunk=int(os.environ.get("ER_S2_QCHUNK", 2_000_000))):
     """Stage-2 probabilities with record-graph features, built per chunk of queries.
 
     The --noent stage-2 model only uses query-side features, which are exact within a chunk
@@ -96,8 +96,61 @@ def _stage2_nb(sc, nbf, rec, s1, m2, q_chunk=2_000_000):
     return pl.concat(parts)
 
 
+def _predict_nb_stream(cfg, m2, q_chunk=1_000_000):
+    """Record-graph stage 2 streamed from the caches, one range of queries at a time.
+
+    Reads the stage-1 scores, the graph-proposed pairs and the graph features from disk per
+    range, and loads only the record columns stage 2 needs, so peak memory stays a few GB
+    for any number of pairs. Same result as the in-memory path (query-side features only).
+    """
+    fpath = config.work(f"test_nb_feat{neighbors._TAG}.parquet")
+    npath = config.work(f"test_nb_new{neighbors._TAG}.parquet")
+    base = pl.scan_parquet(config.work("test_scores_s1.parquet"))
+    new = pl.scan_parquet(npath)
+    feats = pl.scan_parquet(fpath)
+    cols = ["rid", "entity_id", "src", "core", "core_sk", "name_full", "nums", "legal", "country"]
+    rec = pl.read_parquet(config.work("test_records.parquet"), columns=cols)
+    s1 = rec.filter(pl.col("src") == 1)
+    idf = fine.init_idf(s1["core_sk"])
+    names = base.collect_schema().names()
+    qids = feats.select("q_rid").unique().collect()["q_rid"].sort()
+    parts = []
+    for i in range(0, len(qids), q_chunk):
+        lo, hi = qids[i], qids[min(i + q_chunk, len(qids)) - 1]
+        inq = pl.col("q_rid").is_between(lo, hi)
+        b = base.filter(inq).collect()
+        sc = pl.concat([b, new.filter(inq).collect().join(b.select("q_rid", "e_rid"), on=["q_rid", "e_rid"],
+                                                          how="anti").select(names)])
+        X = (stage2.build(sc, rec, idf).select("q_rid", "e_rid", *stage2.FEATURES)
+             .join(feats.filter(inq).collect(), on=["q_rid", "e_rid"], how="left")
+             .with_columns([pl.col(c).fill_null(0) for c in neighbors.NB_FEATURES]))
+        p = m2.predict(X.select(m2.feature_name()).to_numpy().astype(np.float32), num_threads=config.N_JOBS)
+        parts.append(X.select("q_rid", "e_rid").with_columns(pl.Series("p", p)))
+        del X, sc, b
+        print(f"[stage2-nb] {min(i + q_chunk, len(qids)):,}/{len(qids):,} queries", flush=True)
+    sc = pl.concat(parts)
+    r = cfg.get("shift", 1.0)
+    return sc.with_columns((r * pl.col("p") / (r * pl.col("p") + 1 - pl.col("p"))).alias("p")), rec, s1
+
+
 def main():
+    global RIDS, EIDS
     t = time.time()
+    if "--stream" in sys.argv:  # low-memory record-graph prediction from the caches
+        cfg = json.load(open(config.work(f"final{TAG}.json")))
+        m2 = lgb.Booster(model_file=config.work(f"model_s2{TAG}.txt"))
+        sc, rec, s1 = _predict_nb_stream(cfg, m2)
+        RIDS, EIDS = rec["rid"], rec["entity_id"]
+        pred = decide(sc)
+        print(f"[predict] {pred.height:,} matched queries of {sc['q_rid'].n_unique():,} "
+              f"(rule expf, shift {cfg.get('shift', 1.0)}, stage 2, streamed)  {time.time() - t:.0f}s")
+        s1ids = s1.select("rid", "entity_id")
+        write_lists(s1ids, pred.select("e_rid", "q_rid"), "matched_entity_ids",
+                    os.path.join(config.OUT_DIR, "matching_results.tsv"))
+        write_lists(s1ids, sc.select("e_rid", "q_rid"), "candidate_entity_ids",
+                    os.path.join(config.OUT_DIR, "candidate_pairs.tsv"))
+        print(f"done {time.time() - t:.0f}s")
+        return
     if "--s1-only" in sys.argv:  # only compute and cache the stage-1 test scores
         rec = load_records("test")
         s1 = rec.filter(pl.col("src") == 1)
@@ -113,7 +166,6 @@ def main():
         sc, nbf = neighbors.augment(pl.read_parquet(config.work("test_scores_s1.parquet")), "test")
     rec = load_records("test")
     s1 = rec.filter(pl.col("src") == 1)
-    global RIDS, EIDS
     RIDS, EIDS = rec["rid"], rec["entity_id"]
     if not nb and (not os.path.exists(config.work("test_scores_s1.parquet")) or "--rescore" in sys.argv):
         views = F.SparseViews(s1)

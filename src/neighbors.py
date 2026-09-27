@@ -138,12 +138,13 @@ def _score_pairs(pairs, split):
                                pl.lit(0.0, pl.Float32).alias("bs_n"), pl.lit(99, pl.UInt8).alias("br_n"))
     outs = []
     pairs = pairs.sort("q_rid")  # contiguous queries per chunk keep the per-chunk query set small
-    for i in range(0, pairs.height, 300_000):
-        X = F.build(pairs.slice(i, 300_000), rec, views)
+    step = int(os.environ.get("ER_NB_SCORE_CHUNK", 300_000))  # smaller = less memory
+    for i in range(0, pairs.height, step):
+        X = F.build(pairs.slice(i, step), rec, views)
         p = m1.predict(X.select(F.FEATURES).to_numpy().astype(np.float32), num_threads=config.N_JOBS)
         outs.append(X.select("q_rid", "e_rid", *stage2.CARRY).with_columns(pl.Series("p", p.astype(np.float32))))
         del X
-        print(f"[nb-score] {min(i + 300_000, pairs.height):,}/{pairs.height:,} new pairs", flush=True)
+        print(f"[nb-score] {min(i + step, pairs.height):,}/{pairs.height:,} new pairs", flush=True)
     return pl.concat(outs)
 
 
@@ -195,7 +196,7 @@ def _features(nb, all_sc, sc_pairs, rk):
     return new, f
 
 
-def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
+def augment(sc, split, all_sc=None, log="nb", q_chunk=None):
     """Add neighbour-proposed candidates to `sc` and return (sc_plus, nb feature table).
 
     sc: the stage-1 pairs that go to stage 2. all_sc: every stage-1 score available for the
@@ -203,6 +204,7 @@ def augment(sc, split, all_sc=None, log="nb", q_chunk=1_000_000):
     bound memory.
     """
     t = time.time()
+    q_chunk = q_chunk or int(os.environ.get("ER_NB_QCHUNK", 1_000_000))  # smaller = less memory
     # finished graph features are cached too (written by `neighbors.py <split> --score`), so the
     # stage-2 process never holds the links, record keys and votes; delete the cache after
     # changing the graph features

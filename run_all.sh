@@ -7,7 +7,9 @@ set -euo pipefail
 cd "$(dirname "$0")/src"
 PY=${PYTHON:-python}
 export PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1
-export ER_JOBS=${ER_JOBS:-10} POLARS_MAX_THREADS=${POLARS_MAX_THREADS:-10} OMP_NUM_THREADS=${OMP_NUM_THREADS:-10}
+export ER_JOBS=${ER_JOBS:-16} POLARS_MAX_THREADS=${POLARS_MAX_THREADS:-16} OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
+# record graph: 10 neighbours, proposal bar 0.25, up to 3 proposed candidates per record
+export ER_NB_K=10 ER_NB_NEW_MIN=0.25 ER_NB_NEW_PER_Q=3
 
 $PY prep.py train test                                # ~5 min   normalise + transliterate all records
 $PY blocking.py train                                 # ~18 min  candidate generation (train)
@@ -18,6 +20,6 @@ $PY extend_val.py 0.10 --out=val3                     # ~22 min  stage-1 scores,
 $PY predict.py --s1-only                              # ~2.5 h   stage-1 scores for all test pairs
 $PY neighbors.py train --score                        # ~35 min  record graph on the held-out sets
 $PY xwords.py                                         # ~1 min   fingerprint tables (extra-word match rates)
-$PY train_s2.py --ext=3 --noent --big --nb --tag=_nb4 # ~50 min  stage-2 re-scorer (CV) + decision rule
+$PY train_s2.py --ext=3 --noent --big --nb --tag=_nb6 # ~60 min  stage-2 re-scorer (CV) + decision rule
 $PY neighbors.py test --score                         # ~50 min  record graph on test
-$PY predict.py --tag=_nb4 --nb                        # ~1 h     test inference, writes output/
+$PY predict.py --tag=_nb6 --nb                        # ~40 min  test inference, writes output/ (--stream: low memory)
