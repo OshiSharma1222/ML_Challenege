@@ -72,19 +72,35 @@ def search(split, qrids, log="nb"):
     else:
         qs = pool.join(pl.DataFrame({"rid": np.asarray(qrids, dtype=np.uint32)}), on="rid", how="semi")
     bounds = np.linspace(0, pool.height, N_CHUNKS + 1).astype(int)
-    best = None
+    # each (index chunk, query slice) result is its own part on disk: memory stays bounded for
+    # large K, and an interrupted search resumes where it stopped
+    part_dir = config.work(f"{split}_nb{_KTAG}_parts")
+    os.makedirs(part_dir, exist_ok=True)
     for c in range(N_CHUNKS):
+        parts = {i: os.path.join(part_dir, f"c{c}_{i:09d}.parquet") for i in range(0, qs.height, Q_CHUNK)}
+        todo = [i for i, f in parts.items() if not os.path.exists(f)]
+        if not todo:
+            continue
         idx = B.Index(pool.slice(bounds[c], bounds[c + 1] - bounds[c]), True)
-        for i in range(0, qs.height, Q_CHUNK):
+        for i in todo:
             r = (idx.query(qs.slice(i, Q_CHUNK), K + 1, config.N_JOBS, "nb")
                  .select("q_rid", pl.col("e_rid").alias("r_rid"), pl.col("bs_nb").alias("s"))
                  .filter(pl.col("q_rid") != pl.col("r_rid")))
-            best = r if best is None else pl.concat([best, r])
-        best = best.sort("s", descending=True).group_by("q_rid", maintain_order=True).head(K)
+            r.write_parquet(parts[i] + ".tmp")
+            os.replace(parts[i] + ".tmp", parts[i])
         del idx
-        print(f"[{log}] chunk {c + 1}/{N_CHUNKS}: {best.height:,} links  {time.time() - t:.0f}s", flush=True)
-    nb = best.with_columns(pl.col("s").rank("ordinal", descending=True).over("q_rid")
-                           .cast(pl.UInt8).alias("r_rank"))
+        print(f"[{log}] chunk {c + 1}/{N_CHUNKS} searched  {time.time() - t:.0f}s", flush=True)
+    del pool, qs
+    lazy = pl.scan_parquet(os.path.join(part_dir, "*.parquet"))
+    qids = lazy.select("q_rid").unique().collect()["q_rid"].sort()
+    out = []
+    for i in range(0, len(qids), 1_000_000):  # top-K over all index chunks, per range of queries
+        lo, hi = qids[i], qids[min(i + 1_000_000, len(qids)) - 1]
+        out.append(lazy.filter(pl.col("q_rid").is_between(lo, hi)).collect()
+                   .sort("s", descending=True).group_by("q_rid", maintain_order=True).head(K))
+    nb = pl.concat(out).with_columns(pl.col("s").rank("ordinal", descending=True).over("q_rid")
+                                     .cast(pl.UInt8).alias("r_rank"))
+    print(f"[{log}] {nb.height:,} links  {time.time() - t:.0f}s", flush=True)
     nb.write_parquet(path)
     return nb
 
